@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app import changelog
@@ -54,7 +54,7 @@ STARTED_AT = datetime.now(timezone.utc).isoformat()
 _scheduler: BackgroundScheduler | None = None
 
 # Paths that podcast apps access — no auth required
-_PUBLIC_PREFIXES = ("/feed/", "/audio/", "/thumbnails/", "/health")
+_PUBLIC_PREFIXES = ("/feed/", "/audio/", "/thumbnails/", "/static/", "/health", "/favicon.ico")
 
 # Rate limiting: max failed auth attempts per IP within the window
 _RATE_LIMIT_MAX = 10
@@ -213,7 +213,13 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 app.mount("/thumbnails", StaticFiles(directory=THUMBNAIL_DIR), name="thumbnails")
-app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse(os.path.join(STATIC_DIR, "favicon.ico"))
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +366,12 @@ _PAGE = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
-    <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+    <link rel="icon" href="/static/favicon.ico" sizes="48x48">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
+    <link rel="manifest" href="/static/site.webmanifest">
+    <meta name="theme-color" content="#0e1020">
     <link rel="stylesheet" href="/static/styles.css">
     <title>Slipcast</title>
 </head>
@@ -369,10 +380,16 @@ _PAGE = """<!DOCTYPE html>
     <header class="appbar">
         <div class="appbar-inner">
             <div class="brand">
-                <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" width="26" height="26">
-                    <path d="M4 14a8 8 0 0 1 8-8" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
-                    <path d="M4 19a13 13 0 0 1 13-13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".55"/>
-                    <circle cx="6" cy="18" r="2.4" fill="currentColor"/>
+                <svg class="brand-mark" viewBox="0 0 48 48" aria-hidden="true" width="26" height="26">
+                    <defs>
+                        <linearGradient id="sc-grad" x1="0" y1="0" x2="1" y2="1">
+                            <stop offset="0" stop-color="#F40A02"/>
+                            <stop offset="1" stop-color="#5415A0"/>
+                        </linearGradient>
+                    </defs>
+                    <path d="M8 13.5c0-3.5 3.8-5.7 6.8-3.9l15 9.1c2.9 1.8 2.9 6 0 7.8l-15 9.1c-3 1.8-6.8-.4-6.8-3.9V13.5z" fill="url(#sc-grad)"/>
+                    <path d="M34 17a10.5 10.5 0 0 1 0 14" fill="none" stroke="url(#sc-grad)" stroke-width="3.6" stroke-linecap="round"/>
+                    <path d="M39.5 12.5a17.5 17.5 0 0 1 0 23" fill="none" stroke="url(#sc-grad)" stroke-width="3.6" stroke-linecap="round"/>
                 </svg>
                 <span class="brand-name">Slipcast</span>
             </div>

@@ -42,8 +42,10 @@ def build_feed(channel_id: str) -> bytes:
              for ep in episodes if is_safe_media_name(ep["thumbnail"])),
             None,
         )
-    if channel_image_url:
-        fg.podcast.itunes_image(channel_image_url)
+    # Fall back to the branded Slipcast cover so every feed has artwork.
+    if not channel_image_url:
+        channel_image_url = f"{BASE_URL}/static/cover-512.png"
+    fg.podcast.itunes_image(channel_image_url)
 
     for ep in episodes:
         # An item needs a valid enclosure; skip rather than emit a path built

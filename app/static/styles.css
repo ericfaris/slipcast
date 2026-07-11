@@ -7,10 +7,12 @@
   --muted: #6b7191;
   --faint: #9aa0c0;
   --border: #e7e9f4;
-  --primary: #5145e5;
+  --primary: #6d28d9;
   --primary-ink: #ffffff;
-  --primary-soft: #ecebfe;
+  --primary-soft: #efe7fd;
   --accent: #0ea5a4;
+  --brand-a: #f40a02;
+  --brand-b: #5415a0;
   --success: #16a34a;
   --success-soft: #e7f6ed;
   --warn: #b45309;
@@ -21,7 +23,7 @@
   --shadow-lg: 0 12px 40px rgba(24, 27, 46, .18);
   --radius: 16px;
   --radius-sm: 10px;
-  --ring: 0 0 0 3px rgba(81, 69, 229, .35);
+  --ring: 0 0 0 3px rgba(109, 40, 217, .35);
   --maxw: 1080px;
 }
 
@@ -34,8 +36,8 @@
     --muted: #a6abce;
     --faint: #767ca6;
     --border: #2a2f4f;
-    --primary: #7c74ff;
-    --primary-soft: #272655;
+    --primary: #9d7bff;
+    --primary-soft: #2c1e50;
     --success-soft: #14301f;
     --warn-soft: #3a2a12;
     --danger-soft: #3a1c1c;
@@ -273,7 +275,7 @@ input[type=text], input[type=search], input[type=file], select {
 .ch-select input { width: 17px; height: 17px; accent-color: var(--primary); cursor: pointer; }
 .ch-avatar {
   width: 48px; height: 48px; border-radius: 12px; flex: none;
-  background: linear-gradient(135deg, var(--primary), var(--accent));
+  background: linear-gradient(135deg, var(--brand-a), var(--brand-b));
   color: #fff; display: grid; place-items: center; font-weight: 700; font-size: 1.1rem;
   object-fit: cover; overflow: hidden;
 }

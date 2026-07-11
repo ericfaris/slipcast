@@ -8,6 +8,15 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.9.0",
+        "date": "2026-07-11",
+        "changes": [
+            "New Slipcast logo and full favicon set (browser tabs, iOS home screen, high-res app icons) plus a web app manifest so the dashboard installs as a standalone app.",
+            "Refreshed the brand palette to match the new logo, with a red-to-purple gradient on channel avatars.",
+            "Feeds without their own artwork now fall back to the branded Slipcast cover image.",
+        ],
+    },
+    {
         "version": "1.8.3",
         "date": "2026-06-27",
         "changes": [
