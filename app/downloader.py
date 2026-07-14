@@ -361,14 +361,19 @@ def _download_entry(entry: dict, channel_id: str, channel_name: str) -> dict | N
     }
 
 
+def _remove_if_exists(path: str) -> None:
+    if os.path.exists(path):
+        os.remove(path)
+        logger.info("Pruned %s", path)
+
+
 def _prune_channel(channel_id: str):
     episodes = db.get_episodes(channel_id)
     to_delete = episodes[MAX_EPISODES_PER_CHANNEL:]
     for ep in to_delete:
-        filepath = os.path.join(_audio_dir_for(channel_id), ep["filename"])
-        if os.path.exists(filepath):
-            os.remove(filepath)
-            logger.info("Pruned %s", filepath)
+        _remove_if_exists(os.path.join(_audio_dir_for(channel_id), ep["filename"]))
+        if ep["thumbnail"]:
+            _remove_if_exists(os.path.join(_thumbnail_dir_for(channel_id), ep["thumbnail"]))
         db.delete_episode(ep["id"])
         # Remember it so we never re-download a video we deliberately dropped.
         # YouTube channel listings aren't strictly chronological (pinned videos,
@@ -377,6 +382,34 @@ def _prune_channel(channel_id: str):
         # download loop (channel order) and prune (upload-date order) fight each
         # other and re-download the same videos every poll forever.
         db.add_skip_video(ep["id"], channel_id, "pruned")
+    # Even with the DB capped, disk can hold files the DB no longer references:
+    # thumbnails that predate thumbnail-pruning, audio left by an interrupted
+    # prune, or yt-dlp `.part`/temp leftovers. Sweep them so only the current
+    # episodes' files remain on disk.
+    _sweep_orphan_files(channel_id)
+
+
+def _sweep_orphan_files(channel_id: str) -> None:
+    """Delete any audio/thumbnail file not referenced by the channel's episodes.
+
+    Runs against whatever the DB currently holds (already capped to
+    MAX_EPISODES_PER_CHANNEL), so it reflects exactly the kept episodes. The
+    channel's cover art (`channel.jpg`) is always preserved.
+    """
+    episodes = db.get_episodes(channel_id)
+    keep_audio = {ep["filename"] for ep in episodes if ep["filename"]}
+    keep_thumbs = {ep["thumbnail"] for ep in episodes if ep["thumbnail"]}
+    keep_thumbs.add("channel.jpg")
+
+    audio_dir = _audio_dir_for(channel_id)
+    for name in os.listdir(audio_dir):
+        if name not in keep_audio:
+            _remove_if_exists(os.path.join(audio_dir, name))
+
+    thumb_dir = _thumbnail_dir_for(channel_id)
+    for name in os.listdir(thumb_dir):
+        if name not in keep_thumbs:
+            _remove_if_exists(os.path.join(thumb_dir, name))
 
 
 def poll_channel(channel_url: str):

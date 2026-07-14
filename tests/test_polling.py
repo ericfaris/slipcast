@@ -58,6 +58,34 @@ def test_prune_records_skip_for_deleted(tmp_path, monkeypatch):
     assert db.get_skip_video_ids(CID) == {f"v{i:03d}" for i in range(5)} - remaining
 
 
+def test_prune_deletes_thumbnails_and_sweeps_orphans(tmp_path, monkeypatch):
+    """Prune deletes the dropped episode's audio + thumbnail, and the sweep
+    removes any leftover files the DB no longer references — except channel.jpg."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 2)
+    audio_dir = downloader._audio_dir_for(CID)
+    thumb_dir = downloader._thumbnail_dir_for(CID)
+
+    for i in range(4):  # v000..v003, oldest..newest by published
+        ep = _ep(i)
+        ep["thumbnail"] = f"v{i:03d}.jpg"
+        db.upsert_episode(ep)
+        open(os.path.join(audio_dir, ep["filename"]), "wb").close()
+        open(os.path.join(thumb_dir, ep["thumbnail"]), "wb").close()
+
+    # Cover art and stray leftovers that no episode references.
+    open(os.path.join(thumb_dir, "channel.jpg"), "wb").close()
+    open(os.path.join(audio_dir, "orphan.mp3.part"), "wb").close()
+    open(os.path.join(thumb_dir, "ghost.jpg"), "wb").close()
+
+    downloader._prune_channel(CID)
+
+    kept = {e["id"] for e in db.get_episodes(CID)}
+    assert kept == {"v002", "v003"}  # two newest
+    assert sorted(os.listdir(audio_dir)) == ["v002.mp3", "v003.mp3"]
+    assert sorted(os.listdir(thumb_dir)) == ["channel.jpg", "v002.jpg", "v003.jpg"]
+
+
 def test_poll_does_not_redownload_pruned_video(tmp_path, monkeypatch):
     """Regression: a channel can list an older-dated video at the top of its
     feed (pinned/premiere/re-upload). The download loop walks channel order

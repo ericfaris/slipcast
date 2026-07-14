@@ -8,6 +8,13 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.9.1",
+        "date": "2026-07-14",
+        "changes": [
+            "Pruning a channel now also deletes the dropped episode's thumbnail, and each poll sweeps away any audio/thumbnail files the database no longer references (leftovers from interrupted prunes or older versions that never cleaned up thumbnails). Only the current episodes' files stay on disk.",
+        ],
+    },
+    {
         "version": "1.9.0",
         "date": "2026-07-11",
         "changes": [
