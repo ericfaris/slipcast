@@ -116,6 +116,23 @@ def _client_ip(request: Request) -> str:
     return peer or "unknown"
 
 
+def _client_ip_unverified(request: Request) -> bool:
+    """True if _client_ip() fell back to the trusted-proxy peer itself.
+
+    That happens when a request reaches the app without going through
+    cloudflared (e.g. direct LAN/Tailscale access) and carries none of the
+    forwarding headers, so the peer (typically the Docker bridge gateway) is
+    used as-is. Multiple distinct real clients hitting the app this way all
+    collapse into the same rate-limit bucket and log identity, which can look
+    like one repeat offender when it's actually several. This flag lets the
+    log line say so without changing the bucketing key itself.
+    """
+    peer = request.client.host if request.client else None
+    if not (peer and _is_trusted_proxy(peer)):
+        return False
+    return not any(request.headers.get(h) for h in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"))
+
+
 def _check_rate_limit(ip: str) -> bool:
     """Return True if the IP is rate-limited (too many recent failures)."""
     now = time.monotonic()
@@ -124,11 +141,19 @@ def _check_rate_limit(ip: str) -> bool:
         return len(_failed_attempts[ip]) >= _RATE_LIMIT_MAX
 
 
-def _record_failure(ip: str):
+def _record_failure(ip: str, request: Request | None = None):
     now = time.monotonic()
     with _rate_limit_lock:
         _failed_attempts[ip].append(now)
-    logger.warning("Failed auth attempt from %s", ip)
+    if request is not None and _client_ip_unverified(request):
+        port = request.client.port if request.client else "?"
+        logger.warning(
+            "Failed auth attempt from %s (direct/unverified, peer port %s — "
+            "may be one of several distinct clients bypassing cloudflared)",
+            ip, port,
+        )
+    else:
+        logger.warning("Failed auth attempt from %s", ip)
 
 
 def _clear_failures(ip: str):
@@ -206,7 +231,7 @@ async def auth_middleware(request: Request, call_next):
                 return await call_next(request)
         except Exception:
             pass
-    _record_failure(ip)
+    _record_failure(ip, request)
     return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Slipcast"'})
 
 os.makedirs(AUDIO_DIR, exist_ok=True)
