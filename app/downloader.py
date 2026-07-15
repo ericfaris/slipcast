@@ -414,7 +414,12 @@ def _sweep_orphan_files(channel_id: str) -> None:
 
 def poll_channel(channel_url: str):
     original_url = channel_url.rstrip("/")
-    channel_url = original_url + "/videos"
+    # Strip query/fragment (e.g. share-link `?si=...` tracking params) before
+    # appending "/videos" — otherwise it lands inside the query string and
+    # yt-dlp resolves the malformed URL to the channel's tab list (Videos/
+    # Live/Shorts) instead of actual videos, silently downloading nothing.
+    parsed = urlparse(original_url)
+    channel_url = parsed._replace(query="", fragment="").geturl().rstrip("/") + "/videos"
     logger.info("Polling channel: %s", channel_url)
 
     started_at = datetime.now(timezone.utc).isoformat()

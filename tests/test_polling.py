@@ -244,6 +244,30 @@ def test_poll_skips_members_only_and_records_skip(tmp_path, monkeypatch):
     assert len(db.get_episodes(CID)) == 2
 
 
+def test_poll_strips_query_string_before_appending_videos(tmp_path, monkeypatch):
+    """Regression: a share-link URL like '...?si=X5yUqCOVRTbOweX5' must not
+    become '...?si=X5yUqCOVRTbOweX5/videos' — the query string swallows the
+    '/videos' suffix, making yt-dlp resolve to the channel's tab list instead
+    of its actual videos, so every poll silently downloads nothing."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    raw_url = "https://youtube.com/@jason_samosa?si=X5yUqCOVRTbOweX5"
+    db.add_channel(raw_url)
+
+    fetched_urls = []
+
+    def _fake_fetch(url, max_entries):
+        fetched_urls.append(url)
+        return [], CID, "C"
+
+    monkeypatch.setattr(downloader, "_fetch_channel_entries", _fake_fetch)
+    monkeypatch.setattr(downloader, "valid_cookie_file", lambda _p: True)
+
+    downloader.poll_channel(raw_url)
+
+    assert fetched_urls == ["https://youtube.com/@jason_samosa/videos"]
+
+
 def test_poll_records_ok_run(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
     monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)

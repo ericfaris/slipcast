@@ -8,6 +8,13 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.9.2",
+        "date": "2026-07-15",
+        "changes": [
+            "Fixed a bug where adding a channel via a YouTube share link (containing a `?si=...` tracking parameter) silently downloaded zero episodes, forever — the tracking query broke the URL used to fetch the channel's video list. New channels now correctly backfill their most recent episodes regardless of how the link was copied.",
+        ],
+    },
+    {
         "version": "1.9.1",
         "date": "2026-07-14",
         "changes": [
