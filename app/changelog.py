@@ -8,6 +8,13 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.9.3",
+        "date": "2026-07-16",
+        "changes": [
+            "Fixed a bug where some channel listings included a non-video entry whose ID looked like a video ID but was actually the channel's own ID, causing a confusing 'Video unavailable' error on every poll. Video IDs are now validated against YouTube's actual 11-character format before a download is attempted.",
+        ],
+    },
+    {
         "version": "1.9.2",
         "date": "2026-07-15",
         "changes": [

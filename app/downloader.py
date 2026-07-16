@@ -20,7 +20,11 @@ from app.config import (
 )
 
 _CHANNEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Real YouTube video IDs are exactly 11 chars. Channel listings occasionally
+# surface non-video entries (e.g. a tab link) whose "id" is the 24-char
+# channel ID itself; a loose length let those through to yt-dlp, which then
+# fails with a confusing "Video unavailable" error.
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 # Hosts YouTube/Google serve thumbnails from. We only fetch thumbnail URLs that
 # resolve to these, so attacker-influenced metadata can't point urlretrieve at
