@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.events import EVENT_JOB_ERROR
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -71,8 +72,12 @@ async def lifespan(app: FastAPI):
     db.init_db()
 
     _scheduler = BackgroundScheduler()
-    _scheduler.add_job(poll_all, "interval", hours=POLL_INTERVAL_HOURS)
+    # coalesce + a generous misfire grace so a slow run doesn't permanently
+    # wedge the schedule; max_instances=1 still prevents overlapping polls.
+    _scheduler.add_job(poll_all, "interval", hours=POLL_INTERVAL_HOURS,
+                       coalesce=True, misfire_grace_time=3600, max_instances=1)
     _scheduler.add_job(_prune_rate_limit_table, "interval", hours=1)
+    _scheduler.add_listener(_on_job_error, EVENT_JOB_ERROR)
     _scheduler.start()
 
     channels = db.get_channels()
@@ -169,6 +174,16 @@ def _prune_rate_limit_table():
                  if all(now - t >= _RATE_LIMIT_WINDOW for t in attempts)]
         for ip in stale:
             del _failed_attempts[ip]
+
+
+def _on_job_error(event):
+    """Make APScheduler job crashes loud instead of silent.
+
+    A scheduled job that raises otherwise vanishes with no log line — this is
+    how polling could stop for weeks unnoticed.
+    """
+    logger.error("Scheduled job %s raised an exception", event.job_id,
+                 exc_info=event.exception)
 
 
 # GET endpoints that mutate state ("shareable links"). They bypass the usual

@@ -277,3 +277,58 @@ def send_cookie_alert(force: bool = False) -> bool:
     except Exception as exc:
         logger.error("Failed to send cookie alert email: %s", exc)
         return False
+
+
+def _poll_failure_message(problems: list[str]) -> EmailMessage:
+    ui_url = config.BASE_URL.rstrip("/") + "/"
+    msg = EmailMessage()
+    msg["Subject"] = f"⚠️ Slipcast: {len(problems)} channel(s) had download failures"
+    msg["From"] = config.SMTP_FROM
+    msg["To"] = config.ALERT_EMAIL
+
+    lines = "\n".join(f"  • {p}" for p in problems)
+    msg.set_content(f"""\
+Slipcast — poll completed with errors
+
+The latest channel poll finished, but one or more videos failed to download.
+Cookies look OK (that has its own alert), so this is likely a transient
+YouTube error, a stale yt-dlp, or a video that needs a retry.
+
+Affected:
+{lines}
+
+Open the management UI to retry ("Poll Now" on the channel):
+{ui_url}
+""")
+    return msg
+
+
+def send_poll_failure_alert(problems: list[str], force: bool = False) -> bool:
+    """Email when a poll_all run finishes with per-video download failures.
+
+    This is the 'silent failure' alert: polling keeps running and cookies are
+    fine, but videos are quietly not downloading. Debounced under its own key.
+    Returns True if sent.
+    """
+    if not problems:
+        return False
+    if not _smtp_configured():
+        logger.info("Poll-failure alert not sent: SMTP not configured")
+        return False
+
+    cooldown = config.ALERT_COOLDOWN_HOURS * 3600
+    if not force and (time.time() - _last_sent("poll_failures")) < cooldown:
+        logger.debug("Poll-failure alert suppressed (within %dh cooldown)",
+                     config.ALERT_COOLDOWN_HOURS)
+        return False
+
+    msg = _poll_failure_message(problems)
+    try:
+        _send(msg)
+        _record_sent("poll_failures")
+        logger.info("Sent poll-failure alert to %s (%d channels)",
+                    config.ALERT_EMAIL, len(problems))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to send poll-failure alert email: %s", exc)
+        return False
