@@ -246,7 +246,16 @@ def _base_ydl_opts() -> dict:
     # yt-dlp's default JS runtime is "deno"; we ship Node 22 instead (see
     # Dockerfile) for the YouTube n-challenge solver. Without this, format
     # selection fails with "Requested format is not available".
-    opts = {"quiet": True, "no_warnings": True, "js_runtimes": {"node": {}}}
+    # socket_timeout is critical: without it a stalled TCP read hangs the whole
+    # poll_all run forever. Because APScheduler runs poll_all with the default
+    # max_instances=1, one hung run silently blocks every future scheduled poll
+    # (no error, no log) until the process restarts. Bound every network op.
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "js_runtimes": {"node": {}},
+        "socket_timeout": 30,
+    }
     if valid_cookie_file(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
         logger.info("Using cookies file: %s (%d bytes)", COOKIES_FILE, os.path.getsize(COOKIES_FILE))
@@ -455,6 +464,7 @@ def poll_channel(channel_url: str):
     downloaded = 0
     considered = 0  # real (non-skip, non-members) videos seen, in channel order
     error = None
+    video_failures: list[str] = []  # per-video download errors, for alerting
     try:
         for entry in entries:
             # Only ever look at the channel's newest MAX videos. Walking deeper
@@ -484,20 +494,40 @@ def poll_channel(channel_url: str):
                 logger.debug("Recorded members-only skip: %s", video_id)
                 considered -= 1
                 continue
+            except Exception as exc:  # noqa: BLE001
+                # One video failing to download (403, transient network error,
+                # a yt-dlp/ffmpeg postprocessor bug) must not abort the rest of
+                # this channel — or, via re-raise, every remaining channel in
+                # the poll_all run. Log it, note it for the alert, move on.
+                logger.error("Failed to download %s from %s: %s",
+                             video_id, channel_name, exc)
+                video_failures.append(f"{video_id}: {exc}")
+                if _looks_like_auth_error(str(exc)):
+                    notify.send_cookie_alert()
+                continue
             if result:
                 db.upsert_episode(result)
                 downloaded += 1
                 time.sleep(1)
-    except Exception as exc:  # noqa: BLE001 — record then re-raise for visibility
+    except Exception as exc:  # noqa: BLE001 — record, but never re-raise: a
+        # raise here propagates out of poll_all and kills the scheduled thread,
+        # skipping every channel after this one.
         error = str(exc)
-        raise
+        logger.exception("Unexpected error polling %s", channel_name)
     finally:
         # Always cap to the newest MAX episodes, even if the loop raised.
         _prune_channel(channel_id)
+        run_error = error
+        if not run_error and video_failures:
+            run_error = (f"{len(video_failures)} video(s) failed to download: "
+                         + "; ".join(video_failures[:5]))
         _record_run(original_url, channel_id, started_at,
-                    status="error" if error else "ok",
-                    downloaded=downloaded, channel_name=channel_name, error=error)
-    logger.info("Done polling %s (%s) — %d new", channel_name, channel_id, downloaded)
+                    status="error" if (error or video_failures) else "ok",
+                    downloaded=downloaded, channel_name=channel_name, error=run_error)
+    logger.info("Done polling %s (%s) — %d new, %d failed",
+                channel_name, channel_id, downloaded, len(video_failures))
+    return {"channel_name": channel_name, "downloaded": downloaded,
+            "failures": video_failures, "error": error}
 
 
 def _record_run(url, channel_id, started_at, *, status, downloaded=0,
@@ -536,8 +566,23 @@ def poll_all():
             logger.info("Cookies expire in %d days — sending advance warning", days_left)
             notify.send_cookie_expiry_warning(days_left, status["expires_at"])
     channels = db.get_channels()
+    problems: list[str] = []
     for ch in channels:
-        poll_channel(ch["url"])
+        try:
+            summary = poll_channel(ch["url"])
+        except Exception as exc:  # noqa: BLE001 — belt-and-braces: never let one
+            # channel abort the whole scheduled run.
+            logger.exception("poll_channel crashed for %s", ch["url"])
+            problems.append(f"{ch['url']}: {exc}")
+            continue
+        if summary and (summary["failures"] or summary["error"]):
+            name = summary["channel_name"] or ch["url"]
+            detail = summary["error"] or f"{len(summary['failures'])} video(s) failed"
+            problems.append(f"{name}: {detail}")
+
+    if problems:
+        logger.warning("poll_all finished with %d problem channel(s)", len(problems))
+        notify.send_poll_failure_alert(problems)
 
 
 def download_single(video_url: str, subscribe: bool = False):

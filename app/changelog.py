@@ -8,6 +8,16 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.10.0",
+        "date": "2026-09-01",
+        "changes": [
+            "Polling is now resilient to single-video failures: when one video won't download (a transient YouTube 403, a yt-dlp/ffmpeg hiccup), the poll logs it and moves on instead of aborting that channel — and, previously, every channel queued after it.",
+            "New 'silent failure' email alert: if a poll finishes but some videos quietly failed to download (with cookies still valid), you get an email listing the affected channels so gaps don't go unnoticed for weeks.",
+            "Added a 30-second network timeout to all yt-dlp operations. A stalled download could previously hang the scheduler indefinitely — with no error and no log output — blocking every future poll until a restart.",
+            "Scheduled-job crashes are now logged loudly, and the poll schedule tolerates a slow run instead of wedging permanently.",
+        ],
+    },
+    {
         "version": "1.9.3",
         "date": "2026-07-16",
         "changes": [
