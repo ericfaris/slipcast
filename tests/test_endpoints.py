@@ -302,7 +302,7 @@ def test_thumbnail_blocks_disallowed_urls(url):
 
 @pytest.mark.parametrize("vid,ok", [
     ("dQw4w9WgXcQ", True),
-    ("abc-_123", True),
+    ("abc-_123456", True),
     ("../../etc/passwd", False),
     ("abc/def", False),
     ("a b", False),
