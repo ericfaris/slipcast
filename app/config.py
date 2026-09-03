@@ -4,6 +4,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data")
 AUDIO_DIR = os.path.join(DATA_DIR, "audio")
 THUMBNAIL_DIR = os.path.join(DATA_DIR, "thumbnails")
 DB_PATH = os.path.join(DATA_DIR, "episodes.db")
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 AUTH_USER = os.environ.get("AUTH_USER", "")
@@ -28,6 +29,12 @@ COOKIES_FILE = os.environ.get("COOKIES_FILE", "/data/cookies.txt")
 # channel with no cap made it trivial to fire dozens of concurrent yt-dlp
 # processes; bound it with a worker pool instead.
 POLL_CONCURRENCY = int(os.environ.get("POLL_CONCURRENCY", "2"))
+# Audio grows without bound across all channels combined — MAX_EPISODES_PER_CHANNEL
+# caps each channel individually but nothing accounts for the size of the volume
+# they all share. When free space on the DATA_DIR filesystem drops below this many
+# GB, poll_all() prunes the globally oldest episodes (across channels) before
+# downloading anything more. Set to 0 to disable the check entirely.
+MIN_FREE_DISK_GB = int(os.environ.get("MIN_FREE_DISK_GB", "2"))
 
 # --- Email alerts (cookie expiry / invalid cookies) ---------------------------
 # Configure SMTP to receive an email when the cookies file needs to be re-uploaded.

@@ -521,3 +521,76 @@ def test_poll_all_now_submits_to_executor_not_raw_threads(tmp_path, monkeypatch)
     assert resp.status_code == 200
     assert len(submitted) == 2
     assert all(fn is main._run_poll for fn, _ in submitted)
+
+
+# --- /health/live: the restart-fixable subset --------------------------------
+
+def _live_ok_scheduler(monkeypatch):
+    class _FakeSched:
+        running = True
+    monkeypatch.setattr(main, "_scheduler", _FakeSched())
+
+
+def test_health_live_ignores_expired_cookies(monkeypatch):
+    """The single most important property in the autoheal design.
+
+    Expired cookies make /health degraded, but no restart fixes them — so
+    /health/live must stay 200 or the host restarter loops the container
+    every five minutes until its budget is spent.
+    """
+    db.init_db()
+    monkeypatch.setattr(db, "get_channels", lambda: [])
+    _live_ok_scheduler(monkeypatch)
+    monkeypatch.setattr(main, "cookies_status", lambda: {"present": False, "expired": True})
+
+    live = main.health_live()
+    full = main.health()
+    assert live.status_code == 200
+    assert _health_body(live)["status"] == "ok"
+    assert "cookies" not in _health_body(live)["checks"]
+    assert full.status_code == 503  # the full report still says degraded
+
+
+def test_health_live_degraded_when_scheduler_down(monkeypatch):
+    db.init_db()
+    monkeypatch.setattr(db, "get_channels", lambda: [])
+    monkeypatch.setattr(main, "_scheduler", None)
+
+    resp = main.health_live()
+    assert resp.status_code == 503
+    assert "scheduler is not running" in _health_body(resp)["problems"]
+
+
+def test_health_live_degraded_when_polling_stalled(monkeypatch):
+    db.init_db()
+    monkeypatch.setattr(db, "get_channels", lambda: [{"url": "https://x", "channel_id": None}])
+    monkeypatch.setattr(main, "POLL_INTERVAL_HOURS", 1)
+    _live_ok_scheduler(monkeypatch)
+    monkeypatch.setattr(main, "_STARTED_MONOTONIC", time.monotonic() - 999999)
+    old = "2020-01-01T00:00:00+00:00"
+    monkeypatch.setattr(db, "get_recent_poll_runs",
+                        lambda limit=1: [{"finished_at": old, "started_at": old}])
+
+    resp = main.health_live()
+    assert resp.status_code == 503
+    assert "polling appears stalled" in _health_body(resp)["problems"]
+
+
+def test_health_live_ok_when_polling_recent(monkeypatch):
+    from datetime import datetime, timezone
+    db.init_db()
+    monkeypatch.setattr(db, "get_channels", lambda: [{"url": "https://x", "channel_id": None}])
+    _live_ok_scheduler(monkeypatch)
+    monkeypatch.setattr(main, "cookies_status", lambda: {"present": False, "expired": True})
+    now = datetime.now(timezone.utc).isoformat()
+    monkeypatch.setattr(db, "get_recent_poll_runs",
+                        lambda limit=1: [{"finished_at": now, "started_at": now}])
+
+    resp = main.health_live()
+    assert resp.status_code == 200
+    assert _health_body(resp)["checks"]["polling"] == "ok"
+
+
+def test_health_live_is_public():
+    """The Docker HEALTHCHECK and ops/autoheal.sh curl it without credentials."""
+    assert "/health/live".startswith(main._PUBLIC_PREFIXES)

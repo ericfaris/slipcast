@@ -5,12 +5,16 @@ services:
     build: .
     image: ericfaris/slipcast:latest
     restart: unless-stopped
-    # Reports actual health (scheduler up, polling not stalled, cookies valid)
-    # via /health — see app/main.py. NOTE: with restart: unless-stopped, Compose
-    # does NOT automatically restart a container Docker marks "unhealthy"; this
-    # only makes the status visible (`docker compose ps`, `docker inspect`).
+    # Probes /health/live — the restart-fixable subset of the health report
+    # (scheduler up, polling not stalled). Not /health: that also fails on
+    # expired cookies and low disk, which a restart cannot fix, so an automated
+    # restarter reading it would loop. See app/main.py.
+    # NOTE: with restart: unless-stopped, Compose does NOT automatically restart
+    # a container Docker marks "unhealthy"; this only makes the status visible
+    # (`docker compose ps`, `docker inspect`). ops/autoheal.sh is what actually
+    # restarts a wedged container (bounded at 3 per hour, then emails).
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health/live"]
       interval: 1m
       timeout: 10s
       start_period: 2m
@@ -32,6 +36,10 @@ services:
 
       # How many episodes to keep per channel (older ones are pruned)
       - MAX_EPISODES_PER_CHANNEL=20
+
+      # Below this many GB free on the data volume, the oldest episodes across
+      # all channels are deleted before polling (0 disables). Always emails.
+      - MIN_FREE_DISK_GB=2
 
       # How often to check channels for new videos (in hours)
       - POLL_INTERVAL_HOURS=2

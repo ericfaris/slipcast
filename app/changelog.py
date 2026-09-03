@@ -8,6 +8,17 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.12.0",
+        "date": "2026-09-03",
+        "changes": [
+            "Closed the last two ways a poll could hang forever: downloading a thumbnail and converting it with ffmpeg now both time out (30s and 60s). Neither had any timeout at all, so a thumbnail server that accepted the connection and then went quiet could wedge the scheduler indefinitely — the same silent, log-free failure as the multi-week outage fixed in 1.10.0, just reached by a different route. A thumbnail that times out is now logged and skipped; the episode still downloads.",
+            "New /health/live endpoint: a deliberately narrow report of only the things a restart could plausibly fix (is the scheduler running, has polling stalled). /health is unchanged and remains the full picture, including cookie validity — but because expired cookies are not something restarting repairs, they no longer make the container look restart-worthy. The Docker healthcheck now watches /health/live instead of /health.",
+            "Slipcast can now restart itself when it wedges. A host-side timer (ops/autoheal.sh, installed manually — see ops/README.md) checks /health/live every five minutes and restarts the container when it fails, at most 3 times per hour. After that it stops trying and emails you instead of restarting in a loop, and it keeps reporting until the problem is dealt with. It sends that email directly over SMTP, so it still reaches you when the app itself is down.",
+            "Slipcast now protects itself against a full disk. Per-channel episode caps never accounted for the size of the volume all channels share, so audio could grow until the disk filled — which produces confusing mid-write failures rather than a clear error. When free space drops below the new MIN_FREE_DISK_GB setting (default 2 GB), the oldest episodes across all channels are deleted before polling, just enough to get back above the line, and you always get an email listing exactly what was removed. Set it to 0 to turn the check off.",
+            "The database is now backed up nightly at 03:00 to DATA_DIR/backups/, keeping the last seven snapshots, and checked for corruption on the way. If the check fails or a backup can't be taken, you get an email. Restoring is a documented manual step (see the README) rather than something Slipcast does on its own.",
+        ],
+    },
+    {
         "version": "1.11.0",
         "date": "2026-09-03",
         "changes": [

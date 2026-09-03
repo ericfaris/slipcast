@@ -70,7 +70,11 @@ _scheduler: BackgroundScheduler | None = None
 # that use this still respond right away.
 _poll_executor = ThreadPoolExecutor(max_workers=POLL_CONCURRENCY, thread_name_prefix="poll")
 
-# Paths that podcast apps access — no auth required
+# Paths that podcast apps access — no auth required. Matched as prefixes, so
+# "/health" also covers "/health/live"; keep it that way — the Docker
+# HEALTHCHECK and ops/autoheal.sh both curl /health/live with no credentials,
+# and tightening this to an exact match would silently mark the container
+# unhealthy and (with the autoheal timer running) restart-loop it.
 _PUBLIC_PREFIXES = ("/feed/", "/audio/", "/thumbnails/", "/static/", "/health", "/favicon.ico")
 
 # Rate limiting: max failed auth attempts per IP within the window
@@ -93,6 +97,12 @@ async def lifespan(app: FastAPI):
     _scheduler.add_job(poll_all, "interval", hours=POLL_INTERVAL_HOURS,
                        coalesce=True, misfire_grace_time=3600, max_instances=1)
     _scheduler.add_job(_prune_rate_limit_table, "interval", hours=1)
+    # Nightly DB snapshot + corruption check. 03:00 is a quiet hour, and a fixed
+    # hour is far easier to reason about ("last night's backup") than a 24h
+    # interval anchored to whenever the container last restarted. VACUUM INTO
+    # reads a live WAL database safely, so overlapping a poll is harmless.
+    _scheduler.add_job(db.run_backup_job, "cron", hour=3, coalesce=True,
+                       misfire_grace_time=3600, max_instances=1)
     _scheduler.add_listener(_on_job_error, EVENT_JOB_ERROR)
     _scheduler.start()
 
@@ -992,19 +1002,18 @@ def _seconds_since_last_poll() -> float | None:
     return (datetime.now(timezone.utc) - dt).total_seconds()
 
 
-@app.get("/health")
-def health():
-    """Report actual health, not just "the process is up".
+def _liveness(checks: dict[str, str]) -> list[str]:
+    """Restart-fixable health only: scheduler running + polling not stalled.
 
-    The old unconditional {"status": "ok"} would have reported healthy
-    throughout the v1.10.0 multi-week silent-polling outage this project
-    already suffered — a hung scheduler with no error and no log output.
-    Returns 503 + "degraded" (with a "checks"/"problems" breakdown, nothing
-    sensitive) when the scheduler isn't running, polling has gone stale, or
-    the cookies file is missing/expired.
+    Deliberately excludes cookie validity and disk space — a restart cannot fix
+    either, and the host autoheal script (ops/autoheal.sh) restarts off this
+    signal, so including them would turn a routine cookie expiry into a restart
+    loop every five minutes until the cap trips. Anything added here must be a
+    condition where "restart the container" is a plausible remedy.
+
+    Fills `checks` in place and returns the list of problems found.
     """
     problems: list[str] = []
-    checks: dict[str, str] = {}
 
     scheduler_running = _scheduler is not None and _scheduler.running
     checks["scheduler"] = "running" if scheduler_running else "not running"
@@ -1035,6 +1044,26 @@ def health():
     else:
         checks["polling"] = "ok"
 
+    return problems
+
+
+@app.get("/health")
+def health():
+    """Report actual health, not just "the process is up".
+
+    The old unconditional {"status": "ok"} would have reported healthy
+    throughout the v1.10.0 multi-week silent-polling outage this project
+    already suffered — a hung scheduler with no error and no log output.
+    Returns 503 + "degraded" (with a "checks"/"problems" breakdown, nothing
+    sensitive) when the scheduler isn't running, polling has gone stale, or
+    the cookies file is missing/expired.
+
+    This is the *full* report, for humans and dashboards. /health/live is the
+    narrower restart-fixable subset that automation watches.
+    """
+    checks: dict[str, str] = {}
+    problems = _liveness(checks)
+
     cstatus = cookies_status()
     if not cstatus.get("present"):
         checks["cookies"] = "missing or invalid"
@@ -1053,3 +1082,28 @@ def health():
         "problems": problems,
     }
     return JSONResponse(body, status_code=200 if ok else 503)
+
+
+@app.get("/health/live")
+def health_live():
+    """Narrow liveness signal for the Docker HEALTHCHECK and the host autoheal
+    restarter (ops/autoheal.sh): 200 only when a restart would NOT be pointless.
+
+    Same shape as /health, minus the cookie check. Expired cookies and a full
+    disk make Slipcast degraded but are not things a restart repairs, so they
+    must never appear here — an automated restarter reading this endpoint would
+    otherwise bounce the container in a loop while the real fix (upload fresh
+    cookies, free space) went undone.
+    """
+    checks: dict[str, str] = {}
+    problems = _liveness(checks)
+    ok = not problems
+    return JSONResponse(
+        {
+            "status": "ok" if ok else "degraded",
+            "version": VERSION,
+            "checks": checks,
+            "problems": problems,
+        },
+        status_code=200 if ok else 503,
+    )

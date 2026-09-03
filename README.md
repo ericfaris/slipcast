@@ -81,6 +81,7 @@ All configuration is via environment variables in `docker-compose.yml`. Credenti
 | `AUTH_USERS` | *(none)* | Multi-user credentials, e.g. `alice:pass1,bob:pass2` — takes precedence over `AUTH_USER`/`AUTH_PASS` |
 | `DATA_DIR` | `/data` | Where audio, thumbnails, and the database are stored |
 | `MAX_EPISODES_PER_CHANNEL` | `20` | How many episodes to keep per channel |
+| `MIN_FREE_DISK_GB` | `2` | Below this many GB free on the `DATA_DIR` filesystem, the globally oldest episodes are deleted before polling (`0` disables); always emails what it removed |
 | `POLL_INTERVAL_HOURS` | `2` | How often to check subscribed channels for new videos |
 | `POLL_CONCURRENCY` | `2` | Max channels polled at once by "poll all"/"poll selected" |
 | `COOKIES_FILE` | *(none)* | Path to YouTube cookies file (upload via UI, then uncomment) |
@@ -97,7 +98,7 @@ All configuration is via environment variables in `docker-compose.yml`. Credenti
 - The port is bound to `127.0.0.1` so the app is only reachable from localhost — external traffic must go through a reverse proxy or tunnel (e.g. Cloudflare Tunnel or Tailscale).
 - The management UI (`/`) requires Basic Auth. Feed and audio endpoints (`/feed/`, `/audio/`) are public so podcast apps can access them without credentials.
 - YouTube cookies expire every few weeks. When downloads start failing, re-upload cookies via the management UI and uncomment `COOKIES_FILE`.
-- The container has a Docker `HEALTHCHECK` (mirrored in `docker-compose.yml`) that hits `/health`. With `restart: unless-stopped`, Docker Compose does **not** automatically restart a container just because it's marked unhealthy — the healthcheck only makes the status visible (`docker compose ps`, `docker inspect`); watch for it (e.g. with an external monitor) if you want an actual restart-on-unhealthy.
+- The container has a Docker `HEALTHCHECK` (mirrored in `docker-compose.yml`) that hits `/health/live` — the restart-fixable subset of the health report, deliberately not the full `/health` (which also fails on expired cookies, something no restart repairs). With `restart: unless-stopped`, Docker Compose does **not** automatically restart a container just because it's marked unhealthy — the healthcheck only makes the status visible (`docker compose ps`, `docker inspect`). For an actual restart-on-unhealthy, install the host-side autoheal timer: see [ops/README.md](ops/README.md).
 
 ---
 
@@ -192,7 +193,8 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
 | `GET` | `/feed/<channel_id>.xml` | None | RSS feed for a channel |
 | `GET` | `/audio/<channel_id>/<file>.mp3` | None | Audio file stream |
 | `GET` | `/thumbnails/<channel_id>/<file>.jpg` | None | Thumbnail image |
-| `GET` | `/health` | None | Health check — 200 `{"status":"ok",...}` when healthy, 503 `{"status":"degraded",...}` (with a `checks`/`problems` breakdown) if the scheduler isn't running, polling has gone stale (no run in ~3x `POLL_INTERVAL_HOURS`, past an initial startup grace period), or cookies are missing/expired |
+| `GET` | `/health` | None | Full health report — 200 `{"status":"ok",...}` when healthy, 503 `{"status":"degraded",...}` (with a `checks`/`problems` breakdown) if the scheduler isn't running, polling has gone stale (no run in ~3x `POLL_INTERVAL_HOURS`, past an initial startup grace period), or cookies are missing/expired. This is the one to read yourself; automation should use `/health/live` |
+| `GET` | `/health/live` | None | Liveness check — the same report **minus** the cookie check: 200 only when a restart would plausibly help (scheduler running, polling not stalled). Expired cookies and low disk deliberately do **not** fail it, since restarting fixes neither. This is what the Docker healthcheck and [ops/autoheal.sh](ops/README.md) watch |
 | `GET` | `/add?channel=<url>` | Required | Add a channel via shareable link |
 | `GET` | `/download?url=<url>` | Required | Download an episode via shareable link |
 | `POST` | `/channels/add` | Required | Add a channel (form) |
@@ -212,7 +214,7 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
 2. **Filtering** — member-only, subscriber-only, and premium videos are skipped during automatic polls
 3. **Downloading** — new videos are downloaded as MP3 (128kbps) to `DATA_DIR/audio/<channel_id>/`
 4. **Thumbnails** — channel cover art and per-episode thumbnails are downloaded and converted to JPEG (YouTube often serves WebP; ffmpeg converts them for podcast app compatibility)
-5. **Pruning** — once a channel exceeds `MAX_EPISODES_PER_CHANNEL`, the oldest episodes are deleted
+5. **Pruning** — once a channel exceeds `MAX_EPISODES_PER_CHANNEL`, the oldest episodes are deleted. Separately, if free disk falls below `MIN_FREE_DISK_GB`, the oldest episodes **across all channels** are deleted at the start of a poll until it's back above the line (you get an email listing them)
 6. **Feed generation** — RSS feeds are built dynamically from the SQLite database on each request
 7. **Deduplication** — already-downloaded files are skipped by file existence check
 
@@ -224,6 +226,8 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
 ./data/
 ├── episodes.db              # SQLite database
 ├── cookies.txt              # YouTube cookies (uploaded via UI)
+├── backups/                 # nightly VACUUM INTO snapshots, last 7 kept
+│   └── episodes-YYYYMMDD-HHMMSS.db
 ├── audio/
 │   └── <channel_id>/
 │       ├── <video_id>.mp3
@@ -234,6 +238,33 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
         ├── <video_id>.jpg   # Per-episode thumbnails
         └── ...
 ```
+
+### Database backup and restore
+
+`episodes.db` holds every subscription and episode record — the audio files on
+disk are meaningless without it. A snapshot is taken automatically every night
+at **03:00** into `DATA_DIR/backups/episodes-YYYYMMDD-HHMMSS.db`, and the **7
+most recent** are kept. The snapshot uses SQLite's `VACUUM INTO`, so it is safe
+to take while a poll is writing and produces a single self-contained file with
+no `-wal`/`-shm` sidecars to keep alongside it.
+
+The same job runs `PRAGMA integrity_check`. If the database reports corruption,
+or a backup can't be taken at all, you get an email (`ALERT_EMAIL`).
+
+Restoring is **deliberately manual** — Slipcast will never overwrite your live
+database on its own, since whatever corrupted it may still be doing so. Pick a
+snapshot from before the problem and:
+
+```bash
+docker compose stop app
+cp data/backups/episodes-YYYYMMDD-HHMMSS.db data/episodes.db
+rm -f data/episodes.db-wal data/episodes.db-shm   # stale WAL from the old DB
+docker compose start app
+```
+
+Removing the `-wal`/`-shm` pair matters: they belong to the database you just
+replaced, and SQLite would otherwise replay that old write-ahead log over your
+restored snapshot.
 
 ---
 
@@ -256,6 +287,14 @@ No local build required.
 ```bash
 docker compose up --build
 ```
+
+### Restart-on-unhealthy (autoheal)
+
+The Docker healthcheck makes a wedged container *visible*, but Compose won't
+restart one on its own. A host-side systemd timer that does — bounded to 3
+restarts per hour, then emailing you instead of looping — ships in `ops/`.
+It isn't installed by default; see **[ops/README.md](ops/README.md)** for the
+install steps and how to check on it.
 
 ### Making the app publicly accessible
 
