@@ -449,28 +449,99 @@ def _setup_tmp_db(tmp_path, monkeypatch):
     db.init_db()
 
 
-def test_resolve_channel_id_exact_url_match(tmp_path, monkeypatch):
+def test_find_channel_row_exact_url_match(tmp_path, monkeypatch):
     _setup_tmp_db(tmp_path, monkeypatch)
     url = "https://www.youtube.com/@A"
     db.add_channel(url)
     db.update_channel_meta(url, CID, "A")
-    assert main._resolve_channel_id_for_removal(url) == CID
+    row = main._find_channel_row(url)
+    assert row["channel_id"] == CID and row["url"] == url
 
 
-def test_resolve_channel_id_falls_back_to_normalized_match(tmp_path, monkeypatch):
-    """Regression: a trailing-slash/tracking-query URL variant must still
-    resolve to the same channel_id as the one stored at add-time."""
+def test_find_channel_row_falls_back_to_normalized_match(tmp_path, monkeypatch):
+    """Regression: a trailing-slash/tracking-query URL variant must still find
+    the row stored at add-time."""
     _setup_tmp_db(tmp_path, monkeypatch)
     stored_url = "https://www.youtube.com/@A"
     db.add_channel(stored_url)
     db.update_channel_meta(stored_url, CID, "A")
     variant = "https://www.youtube.com/@A?si=trackingjunk"
-    assert main._resolve_channel_id_for_removal(variant) == CID
+    assert main._find_channel_row(variant)["channel_id"] == CID
 
 
-def test_resolve_channel_id_returns_none_when_unresolvable(tmp_path, monkeypatch):
+def test_find_channel_row_returns_none_when_unresolvable(tmp_path, monkeypatch):
     _setup_tmp_db(tmp_path, monkeypatch)
-    assert main._resolve_channel_id_for_removal("https://www.youtube.com/@Ghost") is None
+    assert main._find_channel_row("https://www.youtube.com/@Ghost") is None
+
+
+def test_remove_one_with_url_variant_removes_row_episodes_and_files(tmp_path, monkeypatch):
+    """AC6: the v1.11.0 orphan scenario — removing by a URL variant takes the
+    row, the episodes and the files together, leaving nothing orphaned."""
+    _setup_tmp_db(tmp_path, monkeypatch)
+    url = "https://www.youtube.com/@A"
+    db.add_channel(url)
+    db.update_channel_meta(url, CID, "A")
+    db.upsert_episode(_ep(0))
+    db.add_skip_video("vskip", CID, "members-only")
+    audio_dir = downloader._audio_dir_for(CID)
+    open(os.path.join(audio_dir, "v000.mp3"), "wb").close()
+
+    main._remove_one("https://www.youtube.com/@A?si=trackingjunk")
+
+    assert db.get_channels() == []
+    assert db.get_episodes(CID) == []
+    assert db.get_skip_video_ids(CID) == set()
+    assert not os.path.exists(audio_dir)
+    assert downloader.find_orphan_channels() == []
+
+
+def test_remove_one_with_no_match_deletes_nothing(tmp_path, monkeypatch):
+    """The other half of AC6, and the one that makes it structural rather than
+    lucky: with no matching row there is no channel_id to cascade with, so
+    nothing is touched. The old _remove_one could normalize its way to another
+    channel's id and delete that channel's episodes and files while leaving its
+    row in place."""
+    _setup_tmp_db(tmp_path, monkeypatch)
+    url = "https://www.youtube.com/@A"
+    db.add_channel(url)
+    db.update_channel_meta(url, CID, "A")
+    db.upsert_episode(_ep(0))
+    audio_dir = downloader._audio_dir_for(CID)
+    open(os.path.join(audio_dir, "v000.mp3"), "wb").close()
+
+    main._remove_one("https://www.youtube.com/@Ghost")
+
+    assert len(db.get_channels()) == 1
+    assert len(db.get_episodes(CID)) == 1
+    assert os.path.exists(os.path.join(audio_dir, "v000.mp3"))
+
+
+def test_remove_one_on_never_polled_channel_skips_the_cascade(tmp_path, monkeypatch):
+    """AC6b: a pending channel has nothing keyed by a real channel_id, and its
+    placeholder must never be handed to the filesystem helpers (they raise)."""
+    _setup_tmp_db(tmp_path, monkeypatch)
+    url = "https://www.youtube.com/@Unpolled"
+    db.add_channel(url)
+    seen = []
+    monkeypatch.setattr(main, "remove_channel_data", lambda cid: seen.append(cid))
+
+    main._remove_one(url)
+
+    assert db.get_channels() == []
+    assert seen == []
+
+
+def test_api_state_masks_a_pending_channel_id(tmp_path, monkeypatch):
+    """AC5/AC10: an unpolled channel's JSON is byte-identical to pre-1.15 —
+    channel_id None, no feed URL, no thumbnail, no episodes."""
+    import json
+    _setup_tmp_db(tmp_path, monkeypatch)
+    db.add_channel("https://www.youtube.com/@Unpolled")
+    ch = json.loads(main.api_state().body)["channels"][0]
+    assert ch["channel_id"] is None
+    assert ch["feed_url"] is None and ch["thumbnail"] is None
+    assert ch["episodes"] == 0 and ch["bytes"] == 0
+    assert ch["last_poll"] is None
 
 
 def test_remove_one_cleans_up_episodes_and_files(tmp_path, monkeypatch):

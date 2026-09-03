@@ -274,7 +274,8 @@ Tokens are generated for every channel as soon as you upgrade, regardless of whe
 ├── episodes.db              # SQLite database
 ├── cookies.txt              # YouTube cookies (uploaded via UI)
 ├── backups/                 # nightly VACUUM INTO snapshots, last 7 kept
-│   └── episodes-YYYYMMDD-HHMMSS.db
+│   ├── episodes-YYYYMMDD-HHMMSS.db
+│   └── pre-pk-migration-YYYYMMDD-HHMMSS.db   # one-off, never pruned (see below)
 ├── audio/
 │   └── <channel_id>/
 │       ├── <video_id>.mp3   # or <video_id>.opus, depending on AUDIO_CODEC when downloaded
@@ -312,6 +313,23 @@ docker compose start app
 Removing the `-wal`/`-shm` pair matters: they belong to the database you just
 replaced, and SQLite would otherwise replay that old write-ahead log over your
 restored snapshot.
+
+#### The pre-migration snapshot
+
+Upgrading to **v1.15.0** rewrites the `channels` table so that `channel_id` —
+the id every other table, directory and feed URL already uses — is its primary
+key, with `url` demoted to a unique attribute. That runs once, automatically, on
+the first start of the new version, and before it touches anything it writes
+`data/backups/pre-pk-migration-YYYYMMDD-HHMMSS.db`. That file is deliberately
+**never pruned** (the nightly cleanup only matches `episodes-*.db`), because it
+is the only copy of the last pre-migration state.
+
+**Rolling back to v1.14 or earlier requires restoring that snapshot.** Older
+code adds a channel with `INSERT INTO channels (url) VALUES (?)`, which violates
+the new schema's `NOT NULL` on `channel_id` — so an older image pointed at a
+migrated database will fail to add channels. Restore the snapshot with the
+procedure above *and* run the previous image; doing only one of the two is not a
+working rollback.
 
 ---
 

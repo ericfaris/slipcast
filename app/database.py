@@ -11,7 +11,197 @@ from app.config import BACKUP_DIR, DB_PATH
 logger = logging.getLogger(__name__)
 
 
+# --- channel identity -------------------------------------------------------
+
+# The placeholder identity a channels row carries between "the user added this
+# URL" and "the first successful poll told us the real YouTube channel id".
+# Since 1.15 channel_id is the primary key of `channels`, so a row has to have
+# one from the instant it is inserted; this is that value.
+#
+# The colon in the prefix is load-bearing. It makes a placeholder fail
+# _CHANNEL_ID_RE (^[A-Za-z0-9_-]{1,64}$) — the validator used by
+# downloader._audio_dir_for()/_thumbnail_dir_for() (which raise on a non-match)
+# and by every channel_id-taking route in app/main.py (which return HTTP 400).
+# So a placeholder that ever leaks toward a filesystem path or a public URL
+# fails loudly and immediately instead of quietly creating a
+# data/audio/pending:…/ directory. It also cannot collide with a real YouTube
+# channel id (UC…, 24 chars, same charset), and a client cannot submit one as a
+# valid channel_id. If this format ever changes, re-derive that property.
+_PENDING_PREFIX = "pending:"
+
+
+def new_pending_channel_id() -> str:
+    """A fresh placeholder identity for a channels row that has never polled."""
+    return _PENDING_PREFIX + secrets.token_hex(16)
+
+
+def is_pending_channel_id(cid: str | None) -> bool:
+    """True when a channel_id is a placeholder, i.e. "not resolved yet".
+
+    This is the masking predicate: at the two boundaries that used to observe a
+    NULL channel_id — get_channel_id_for_url() and main.api_state() — a pending
+    id is reported back as None, which keeps the JSON API and the poller's
+    "have we resolved this channel yet?" logic byte-identical to pre-1.15.
+    """
+    return bool(cid) and cid.startswith(_PENDING_PREFIX)
+
+
+# --- channels primary-key migration (v1.15.0) -------------------------------
+
+# The new-schema column list, in the order the migrated table declares them.
+# The carried-column list is built from this whitelist (never from raw input),
+# which is what makes the f-string interpolation in the migration safe.
+_CHANNELS_COLUMNS = ("channel_id", "url", "channel_name", "added_at", "feed_token",
+                     "itunes_category", "itunes_language", "itunes_explicit")
+
+_CHANNELS_NEW_DDL = """
+    CREATE TABLE channels_new (
+        channel_id      TEXT PRIMARY KEY NOT NULL,
+        url             TEXT NOT NULL UNIQUE,
+        channel_name    TEXT,
+        added_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        feed_token      TEXT,
+        itunes_category TEXT,
+        itunes_language TEXT,
+        itunes_explicit TEXT
+    )
+"""
+
+# The rows the migration keeps: one per distinct channel_id (the lowest rowid,
+# i.e. the first added — the one most likely to hold the feed_token a podcast
+# app is already subscribed with), plus every channel_id IS NULL row (those
+# were distinct by url, and each gets its own placeholder identity).
+_CHANNELS_KEEP_FILTER = """
+    rowid IN (SELECT MIN(rowid) FROM channels
+              WHERE channel_id IS NOT NULL GROUP BY channel_id)
+    OR channel_id IS NULL
+"""
+
+
+def _needs_channels_pk_migration(conn) -> bool:
+    """True when `channels` still has the pre-1.15 `url PRIMARY KEY` shape.
+
+    PRAGMA table_info's `pk` flag is the detection, not a string match on the
+    stored CREATE statement: ALTER TABLE ... RENAME rewrites that text (it comes
+    back as `CREATE TABLE "channels"`, quoted), so comparing SQL would be
+    fragile. No channels table at all means a fresh DB — nothing to migrate; the
+    CREATE TABLE IF NOT EXISTS in init_db() builds the new shape directly.
+    """
+    return any(r["name"] == "url" and r["pk"] for r in
+               conn.execute("PRAGMA table_info(channels)").fetchall())
+
+
+def _migrate_channels_to_channel_id_pk() -> None:
+    """Rewrite `channels` so channel_id is the primary key and url an attribute.
+
+    Every other table (episodes, skip_videos, unsubscribed_channels, poll_runs),
+    every on-disk directory and every feed URL is already keyed by channel_id;
+    only `channels` keyed on url. That split identity is what allowed a delete
+    (keyed on url) and its cascade (keyed on a separately-resolved channel_id)
+    to disagree and strand data — the bug patched in v1.11.0. One key kills it.
+
+    SQLite cannot change a primary key in place, so this is the standard
+    create-copy-drop-rename dance. Three ordering constraints make it live in
+    its own short-lived connection, opened and closed before init_db()'s main
+    block rather than inside it:
+
+    * The backup must be taken BEFORE the transaction opens — backup_db() uses
+      VACUUM INTO, which cannot run inside a transaction, and a snapshot taken
+      mid-migration would capture the half-migrated state, defeating the point.
+    * PRAGMA journal_mode=WAL (init_db()'s first statement) also cannot run
+      inside a transaction.
+    * A second connection opened while the first held a write lock would just
+      contend with it.
+
+    BEGIN IMMEDIATE is mandatory, not decoration. The Python driver does not
+    open a transaction for DDL (conn.in_transaction stays False after a CREATE
+    TABLE), so without an explicit BEGIN the `CREATE TABLE channels_new` commits
+    on its own; a failure at any later point then strands a channels_new table
+    in the file, and the next boot's migration dies on "table already exists" —
+    an app that cannot start. With the explicit BEGIN the whole sequence rolls
+    back cleanly. Raises on failure for the same reason: a half-understood
+    database must not be served by code that assumes the new schema. The
+    operator restores the snapshot whose path is logged just below.
+    """
+    with get_conn() as conn:
+        if not _needs_channels_pk_migration(conn):
+            return  # fresh DB or already migrated — this is the idempotency guarantee
+        old_cols = [r["name"] for r in conn.execute("PRAGMA table_info(channels)").fetchall()]
+        before = conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
+        null_urls = conn.execute("SELECT COUNT(*) FROM channels WHERE url IS NULL").fetchone()[0]
+        dropped = [r["url"] for r in conn.execute(
+            "SELECT url FROM channels WHERE channel_id IS NOT NULL "
+            "AND rowid NOT IN (SELECT MIN(rowid) FROM channels "
+            "                  WHERE channel_id IS NOT NULL GROUP BY channel_id)"
+        ).fetchall()]
+
+    logger.warning("Migrating `channels` to a channel_id primary key (%d row(s))", before)
+    snapshot = backup_db(prefix="pre-pk-migration")
+    logger.warning("Pre-migration snapshot written: %s — restore this file (and the "
+                   "previous image; older code cannot write the new schema) if "
+                   "anything looks wrong afterwards", snapshot)
+    if dropped:
+        logger.warning("Collapsing %d duplicate channel row(s) sharing a channel_id "
+                       "with an older row; these URLs will disappear from the "
+                       "dashboard: %s", len(dropped), ", ".join(dropped))
+    if null_urls:
+        logger.warning("%d channel row(s) had a NULL url and are being given a "
+                       "placeholder 'unknown:' URL so the migration can proceed",
+                       null_urls)
+
+    # Only the columns the new table declares AND the old table actually has,
+    # so one migration handles a v1.14 database (which has feed_token/itunes_*)
+    # and any older one (which doesn't — those simply come out NULL, and
+    # init_db()'s ALTER TABLE ADD COLUMN block then becomes a no-op because the
+    # new table already declares them). channel_id/url are excluded here; they
+    # are handled by the COALESCE expressions below.
+    carried = [c for c in _CHANNELS_COLUMNS
+               if c not in ("channel_id", "url") and c in old_cols]
+    carried_sql = "".join(f", {c}" for c in carried)
+
+    with get_conn() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Belt-and-braces against a pre-1.15 build that crashed mid-migration
+            # without the transaction. The BEGIN above is the real fix.
+            conn.execute("DROP TABLE IF EXISTS channels_new")
+            conn.execute(_CHANNELS_NEW_DDL)
+            # COALESCE on channel_id gives an unpolled row a placeholder
+            # identity. COALESCE on url is purely defensive: url was a
+            # rowid-table TEXT PRIMARY KEY, which SQLite (legacy quirk) lets
+            # hold NULL, and NOT NULL would abort the migration — an aborting
+            # init_db() means the container never starts. A junk-but-present URL
+            # beats a boot loop.
+            conn.execute(f"""
+                INSERT INTO channels_new (channel_id, url{carried_sql})
+                SELECT COALESCE(channel_id, ? || lower(hex(randomblob(16)))),
+                       COALESCE(url, 'unknown:' || lower(hex(randomblob(8)))){carried_sql}
+                FROM channels
+                WHERE {_CHANNELS_KEEP_FILTER}
+            """, (_PENDING_PREFIX,))
+            conn.execute("DROP TABLE channels")
+            conn.execute("ALTER TABLE channels_new RENAME TO channels")
+            conn.execute("COMMIT")
+        except Exception:
+            logger.exception("channels primary-key migration FAILED — rolling back. "
+                             "The database is unchanged; restore %s if in doubt",
+                             snapshot)
+            conn.rollback()
+            raise
+        after = conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
+        result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        logger.warning("channels migration complete: %d row(s) in, %d row(s) out, "
+                       "integrity_check=%s", before, after, result)
+
+
 def init_db():
+    # First, before anything else touches the table. It has to precede the
+    # CREATE TABLE IF NOT EXISTS below (a silent no-op on an existing table, so
+    # an old-schema DB would otherwise keep the old schema forever while the
+    # code assumed the new one), the ALTER TABLE ADD COLUMN block, and the
+    # feed-token backfill (whose WHERE channel_id = ? key only exists after the
+    # migration).
+    _migrate_channels_to_channel_id_pk()
     with get_conn() as conn:
         # WAL lets readers (e.g. /api/state, polled every few seconds by the
         # dashboard) proceed without blocking on a writer, and vice versa —
@@ -21,10 +211,14 @@ def init_db():
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS channels (
-                url          TEXT PRIMARY KEY,
-                channel_id   TEXT,
-                channel_name TEXT,
-                added_at     TEXT NOT NULL DEFAULT (datetime('now'))
+                channel_id      TEXT PRIMARY KEY NOT NULL,
+                url             TEXT NOT NULL UNIQUE,
+                channel_name    TEXT,
+                added_at        TEXT NOT NULL DEFAULT (datetime('now')),
+                feed_token      TEXT,
+                itunes_category TEXT,
+                itunes_language TEXT,
+                itunes_explicit TEXT
             )
         """)
         conn.execute("""
@@ -103,9 +297,10 @@ def init_db():
         # (which runs on EVERY startup) idempotent: rotating a token here would
         # silently break every already-subscribed podcast app. Each row needs
         # its own secret, so this is a per-row loop rather than one UPDATE.
-        for row in conn.execute("SELECT url FROM channels WHERE feed_token IS NULL").fetchall():
-            conn.execute("UPDATE channels SET feed_token = ? WHERE url = ?",
-                         (secrets.token_urlsafe(24), row["url"]))
+        for row in conn.execute(
+                "SELECT channel_id FROM channels WHERE feed_token IS NULL").fetchall():
+            conn.execute("UPDATE channels SET feed_token = ? WHERE channel_id = ?",
+                         (secrets.token_urlsafe(24), row["channel_id"]))
         for row in conn.execute(
                 "SELECT channel_id FROM unsubscribed_channels WHERE feed_token IS NULL").fetchall():
             conn.execute("UPDATE unsubscribed_channels SET feed_token = ? WHERE channel_id = ?",
@@ -160,10 +355,11 @@ def get_episode(episode_id: str) -> sqlite3.Row | None:
 def get_combined_episodes(limit: int) -> list[sqlite3.Row]:
     """Newest-first episodes across all *subscribed* channels, for /feed/all.xml.
 
-    A subquery rather than a JOIN on channels: two channels rows can legitimately
-    share one channel_id (URL variants for the same channel — see
-    main._resolve_channel_id_for_removal), and a JOIN would then emit that
-    channel's episodes twice, producing duplicate items in the combined feed.
+    A subquery rather than a JOIN on channels. As of 1.15 channel_id is that
+    table's primary key, so two rows can no longer share one and a JOIN would no
+    longer double an episode — but the subquery is equally correct, states the
+    intent ("is this channel subscribed?") more directly than a join whose
+    one-row-ness is an implicit schema assumption, and keeps the diff small.
     """
     with get_conn() as conn:
         return conn.execute("""
@@ -210,10 +406,10 @@ def orphan_channel_ids() -> set[str]:
     """channel_ids referenced by episodes but owned by neither channels nor
     unsubscribed_channels.
 
-    This happens when a channels row is deleted without its channel_id ever
-    being resolved (see main._resolve_channel_id_for_removal) — the episodes,
-    skip_videos, and on-disk files are left behind with no row and no UI to
-    find them. This is the DB-side half of orphan detection; app.downloader
+    Since 1.15 a channels row and its cascade share one identity, so the normal
+    delete path can no longer strand anything; what is left is a backstop for a
+    delete interrupted partway through (row gone, episodes not yet) and for
+    hand-edited data. This is the DB-side half of orphan detection; app.downloader
     also checks for on-disk directories with no matching row at all (a channel
     whose channel_id was resolved and removed, but whose files failed to
     delete, or that never had an episode row to begin with).
@@ -234,13 +430,58 @@ def delete_episode(episode_id: str):
 
 
 def add_channel(url: str):
+    """Add a channel by URL, with a placeholder identity until its first poll.
+
+    Still idempotent: url is UNIQUE, so OR IGNORE fires on a repeat add exactly
+    as it did when url was the primary key (the freshly generated placeholder is
+    simply discarded in that case).
+    """
     with get_conn() as conn:
-        conn.execute("INSERT OR IGNORE INTO channels (url) VALUES (?)", (url,))
+        conn.execute("INSERT OR IGNORE INTO channels (channel_id, url) VALUES (?, ?)",
+                     (new_pending_channel_id(), url))
 
 
-def remove_channel(url: str):
+def remove_channel(channel_id: str):
+    """Delete one channels row by its primary key.
+
+    Keyed on channel_id since 1.15, not url. The caller (main._remove_one) takes
+    this value off the very row it looked up and cascades with the same value,
+    so the delete and the cleanup that follows it cannot target different
+    channels — the structural end of the orphaned-data bug patched in v1.11.0.
+    """
     with get_conn() as conn:
-        conn.execute("DELETE FROM channels WHERE url = ?", (url,))
+        conn.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+
+
+def get_channel_by_url(url: str) -> sqlite3.Row | None:
+    """The whole channels row for an exact URL, or None.
+
+    Row-at-a-time rather than id-at-a-time on purpose: a caller that holds the
+    row can delete it and cascade from the same lookup, which is what makes the
+    two impossible to disagree.
+    """
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM channels WHERE url = ?", (url,)).fetchone()
+
+
+def add_channel_with_id(channel_id: str, url: str, channel_name: str):
+    """Insert a channel whose real channel_id is already known.
+
+    The two call sites that have one up front (main.subscribe_channel and
+    downloader.download_single(subscribe=True)) used to call add_channel() then
+    update_channel_meta() — two writes, with the row briefly holding a
+    placeholder identity in between for no reason. Idempotent on both unique
+    columns: OR IGNORE absorbs a repeat of either the id or the url, and the
+    follow-up UPDATE keeps the name fresh (what update_channel_meta used to do)
+    without touching feed_token or added_at.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO channels (channel_id, url, channel_name) VALUES (?, ?, ?)",
+            (channel_id, url, channel_name),
+        )
+        conn.execute("UPDATE channels SET channel_name = ? WHERE channel_id = ?",
+                     (channel_name, channel_id))
 
 
 def get_channels() -> list:
@@ -257,19 +498,64 @@ def get_channel_meta(channel_id: str):
 
 
 def get_channel_id_for_url(url: str) -> str | None:
+    """The resolved YouTube channel_id for a stored URL, or None.
+
+    A placeholder id reads back as None, so callers keep the pre-1.15 meaning of
+    this function — "has this channel ever polled successfully?" — unchanged
+    (see downloader._poll_channel_locked's known_channel_id).
+    """
     with get_conn() as conn:
         row = conn.execute(
             "SELECT channel_id FROM channels WHERE url = ?", (url,)
         ).fetchone()
-        return row["channel_id"] if row and row["channel_id"] else None
+        if not row or is_pending_channel_id(row["channel_id"]):
+            return None
+        return row["channel_id"] or None
 
 
 def update_channel_meta(url: str, channel_id: str, channel_name: str):
+    """Record a poll's resolved identity on the channels row added as `url`.
+
+    Since 1.15 channel_id is the primary key, so a newly-added channel's first
+    successful poll swaps the row's PK from its `pending:` placeholder to the
+    real YouTube id in place (SQLite does allow updating a primary key value).
+    This runs on EVERY poll, not just the first, so for an already-resolved row
+    it is the same name refresh it always was.
+
+    The collision case: the user added two URL variants of one channel (say
+    /@Chan and /channel/UCx). One resolved first and now owns UCx; the other's
+    first poll would swap onto a taken primary key and raise IntegrityError in
+    the middle of a poll. The resolution is to keep the incumbent and drop the
+    newly-resolving duplicate — the incumbent holds the feed_token and itunes_*
+    settings a podcast app may already be subscribed with, and rotating that
+    token would silently stop that subscription updating. The `url != ?` test is
+    what keeps this branch from firing on the ordinary re-poll of an
+    already-resolved row, where the row holding channel_id IS this row; a
+    too-eager branch here would delete a channel on every single poll.
+
+    BEGIN IMMEDIATE so the check and the swap are one step: concurrent poll
+    threads (POLL_CONCURRENCY) can otherwise both see "no collision" and race.
+    """
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE channels SET channel_id = ?, channel_name = ? WHERE url = ?",
-            (channel_id, channel_name, url)
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        other = conn.execute(
+            "SELECT url FROM channels WHERE channel_id = ? AND url != ?",
+            (channel_id, url),
+        ).fetchone()
+        if other:
+            logger.warning(
+                "Channel %s is already registered as %s — dropping the duplicate "
+                "row added as %s and keeping the existing row's feed token and "
+                "settings", channel_id, other["url"], url)
+            conn.execute("DELETE FROM channels WHERE url = ?", (url,))
+            conn.execute("UPDATE channels SET channel_name = ? WHERE channel_id = ?",
+                         (channel_name, channel_id))
+        else:
+            conn.execute(
+                "UPDATE channels SET channel_id = ?, channel_name = ? WHERE url = ?",
+                (channel_id, channel_name, url)
+            )
+        conn.execute("COMMIT")
 
 
 def get_unsubscribed_channels() -> list:
@@ -356,10 +642,12 @@ def _select_feed_token(conn, channel_id: str) -> str | None:
 def get_or_create_feed_token(channel_id: str) -> str | None:
     """Token for a channel_id, generating one if the owning row has none yet.
 
-    Covers what the init_db() backfill can't: a channels row whose channel_id
-    was still NULL at migration time (it's only populated by update_channel_meta
-    after the first successful poll), and rows added afterwards. Returns None
-    when no row owns that channel_id at all.
+    Covers what the init_db() backfill can't: rows added after it ran, and a row
+    whose identity was still a `pending:` placeholder at backfill time (the
+    backfill gave that placeholder a token; once the first poll swaps the real
+    channel_id in, the token comes along with the row, but a row created between
+    boots has never seen the backfill at all). Returns None when no row owns
+    that channel_id.
 
     The `AND feed_token IS NULL` guard plus the re-read makes two racing callers
     converge on one token rather than the second clobbering (and invalidating)
@@ -499,8 +787,15 @@ def get_last_poll_run_per_channel() -> dict[str, sqlite3.Row]:
 _BACKUP_RETAIN = 7
 
 
-def backup_db() -> str:
+def backup_db(prefix: str = "episodes") -> str:
     """Write a timestamped snapshot of the database into BACKUP_DIR.
+
+    `prefix` names the file. The default is what the nightly job writes and what
+    prune_backups() matches, so those two are unaffected. The channels
+    primary-key migration passes prefix="pre-pk-migration" precisely so its
+    snapshot falls outside the pruner's glob and is kept forever — that is the
+    one irreversible change in the schema's history, and its "before" copy is
+    the only way back.
 
     VACUUM INTO rather than a file copy or Connection.backup(): the DB runs in
     WAL mode (see init_db), where the live file on its own is not a complete
@@ -512,13 +807,13 @@ def backup_db() -> str:
     """
     os.makedirs(BACKUP_DIR, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    dest = os.path.join(BACKUP_DIR, f"episodes-{stamp}.db")
+    dest = os.path.join(BACKUP_DIR, f"{prefix}-{stamp}.db")
     # VACUUM INTO refuses to write to an existing file rather than overwriting
     # it. A same-second collision needs two runs of this job in one second,
     # which shouldn't happen — but a raise here would lose the night's backup,
     # so fall back to a unique name instead of failing.
     if os.path.exists(dest):
-        dest = os.path.join(BACKUP_DIR, f"episodes-{stamp}-{secrets.token_hex(2)}.db")
+        dest = os.path.join(BACKUP_DIR, f"{prefix}-{stamp}-{secrets.token_hex(2)}.db")
     with get_conn() as conn:
         conn.execute("VACUUM INTO ?", (dest,))
     return dest
@@ -529,6 +824,9 @@ def prune_backups(retain: int = _BACKUP_RETAIN) -> list[str]:
 
     The YYYYMMDD-HHMMSS stamp sorts lexicographically, so a plain reverse
     filename sort is a chronological sort — no stat() per file needed.
+
+    Only `episodes-*` is matched, deliberately: the pre-pk-migration snapshot
+    uses its own prefix so it survives forever. Do not widen this glob.
     """
     try:
         names = [n for n in os.listdir(BACKUP_DIR)

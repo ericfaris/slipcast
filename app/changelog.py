@@ -8,6 +8,16 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.15.0",
+        "date": "2026-09-03",
+        "changes": [
+            "Nothing changes for you in this release — and that is the entire point. Internally, a channel is now identified everywhere by its YouTube channel ID, which is what the episode records, the folders on disk and the feed URLs have always used. The channels table itself was the one place still identified by its URL, and that mismatch is what let a removal delete a channel's row while leaving its episodes and downloaded audio behind as invisible orphans — the bug patched in 1.11.0. That patch caught the symptom; this removes the possibility. Feed URLs, feed tokens, episode counts, the dashboard and the API are all unchanged.",
+            "Your database is upgraded automatically the first time this version starts, and a snapshot is taken immediately beforehand into data/backups/pre-pk-migration-<timestamp>.db. Unlike the nightly backups, that one is never deleted. Note that going back to an earlier version afterwards means restoring that snapshot as well as running the older image — older code cannot write to the new database layout.",
+            "One deliberate behaviour change: if you have the same channel added twice under two different URLs (say youtube.com/@Name and youtube.com/channel/UC..., which used to quietly create two dashboard entries), they now collapse into a single entry. The older of the two survives, keeping its feed token and feed settings, so any podcast app already subscribed to it carries on working.",
+            "Adding a channel and removing it before its first poll has finished now works cleanly instead of leaving a half-registered row behind.",
+        ],
+    },
+    {
         "version": "1.14.0",
         "date": "2026-09-03",
         "changes": [

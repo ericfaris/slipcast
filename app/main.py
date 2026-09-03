@@ -802,7 +802,12 @@ def api_state():
 
     channels = []
     for ch in db.get_channels():
-        cid = ch["channel_id"]
+        # Mask the placeholder identity a never-polled channel carries back to
+        # None. Every field below already guards on `if cid`, so an unpolled
+        # channel's JSON stays byte-identical to pre-1.15 — no Share button, no
+        # feed settings, no episode list, all of which would 400 on a
+        # `pending:` id anyway.
+        cid = None if db.is_pending_channel_id(ch["channel_id"]) else ch["channel_id"]
         channels.append({
             "url": ch["url"],
             "channel_id": cid,
@@ -971,8 +976,7 @@ def subscribe_channel(channel_id: str = Form(...), channel_name: str = Form(...)
     if not _CHANNEL_ID_RE.match(channel_id):
         raise HTTPException(status_code=400, detail="Invalid channel ID")
     channel_page_url = f"https://www.youtube.com/channel/{channel_id}"
-    db.add_channel(channel_page_url)
-    db.update_channel_meta(channel_page_url, channel_id, channel_name)
+    db.add_channel_with_id(channel_id, channel_page_url, channel_name)
     db.remove_unsubscribed_channel(channel_id)
     threading.Thread(target=_run_poll, args=[channel_page_url, channel_name], daemon=True).start()
     return _ok(f"Subscribed to {channel_name}")
@@ -985,34 +989,47 @@ def _normalize_channel_url(url: str) -> str:
     return f"{p.netloc.lower()}{p.path.rstrip('/').lower()}"
 
 
-def _resolve_channel_id_for_removal(rurl: str) -> str | None:
-    """Best-effort channel_id lookup for a channels row about to be deleted.
+def _find_channel_row(rurl: str):
+    """The channels row a caller-supplied URL refers to, or None.
 
-    An exact URL match (the old behavior) misses variants — different case,
-    a trailing slash, a tracking query string — and channels removed before
-    update_channel_meta ever populated channel_id. Without a resolved id, the
-    row disappears from the `channels` table but its episodes, skip_videos,
-    and on-disk audio/thumbnails are never cleaned up and become invisible
-    orphans (see find_orphan_channels / the startup reconciler), which is
-    exactly what happened in production. A normalized comparison across all
-    channel rows catches the variant case; if that still fails, the orphan
-    reconciler is the safety net that eventually surfaces what's left behind.
+    An exact match first; failing that, a normalized comparison across all rows,
+    which catches variants — different case, a trailing slash, a tracking query
+    string — of the URL actually stored. /channels/remove is a form endpoint
+    taking an arbitrary url from any caller (the dashboard sends the exact
+    stored URL, but nothing enforces that), so that tolerance stays.
+
+    What changed in 1.15 is that this resolves a *row*, not a bare channel_id.
+    The predecessor (_resolve_channel_id_for_removal) existed to reconcile two
+    identities, and when its normalized fallback matched a different row than
+    the delete did, the delete and the cleanup targeted different channels and
+    stranded data. A row carries its own primary key, so that divergence is no
+    longer expressible.
     """
-    channel_id = db.get_channel_id_for_url(rurl)
-    if channel_id:
-        return channel_id
+    row = db.get_channel_by_url(rurl)
+    if row:
+        return row
     norm = _normalize_channel_url(rurl)
     for ch in db.get_channels():
-        if ch["channel_id"] and _normalize_channel_url(ch["url"]) == norm:
-            return ch["channel_id"]
+        if _normalize_channel_url(ch["url"]) == norm:
+            return ch
     return None
 
 
 def _remove_one(url: str):
-    rurl = url.rstrip("/")
-    channel_id = _resolve_channel_id_for_removal(rurl)
-    db.remove_channel(rurl)
-    if channel_id:
+    row = _find_channel_row(url.rstrip("/"))
+    if not row:
+        # No row matched, so there is nothing to delete — and, crucially,
+        # nothing to cascade against either. The old code could reach a
+        # normalized channel_id here and delete another channel's episodes and
+        # files while leaving its row in place.
+        return
+    channel_id = row["channel_id"]
+    db.remove_channel(channel_id)
+    # A still-pending channel has never polled, so nothing keyed by a real
+    # channel_id exists for it: episodes and skip_videos rows are only ever
+    # written with an id resolved from yt-dlp, and the directory helpers reject
+    # a `pending:` id outright. Skipping the cascade is belt-and-braces.
+    if not db.is_pending_channel_id(channel_id):
         db.delete_episodes_for_channel(channel_id)
         db.delete_skip_videos_for_channel(channel_id)
         remove_channel_data(channel_id)

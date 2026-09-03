@@ -915,8 +915,7 @@ def download_single(video_url: str, subscribe: bool = False):
         channels = db.get_channels()
         if not any(ch["channel_id"] == channel_id for ch in channels):
             channel_page_url = f"https://www.youtube.com/channel/{channel_id}"
-            db.add_channel(channel_page_url)
-            db.update_channel_meta(channel_page_url, channel_id, channel_name)
+            db.add_channel_with_id(channel_id, channel_page_url, channel_name)
             logger.info("Subscribed to channel: %s", channel_name)
     else:
         channels = db.get_channels()
@@ -1050,13 +1049,14 @@ def find_orphan_channels() -> list[dict]:
     """Find channel data (episodes rows and/or on-disk directories) owned by
     neither a `channels` row nor an `unsubscribed_channels` row.
 
-    Two ways this happens: `_remove_one` (app/main.py) fails to resolve a
-    channel_id before deleting the `channels` row (a URL variant, or a channel
-    removed before update_channel_meta ever ran) and leaves its episodes,
-    skip_videos, and files behind; or those files/rows survive a delete that
-    was interrupted partway through. This only detects — nothing here deletes
-    anything; callers decide (see app.main lifespan report and the
-    /channels/remove-orphan endpoint).
+    Since 1.15 a `channels` row and everything keyed off it share one identity,
+    so the old cause — `_remove_one` deleting a row whose channel_id it had
+    failed to resolve — is no longer reachable through the normal path. This
+    stays as a backstop for a delete interrupted partway through (the row is
+    gone, the episodes or files are not) and for hand-edited or externally
+    restored data. This only detects — nothing here deletes anything; callers
+    decide (see app.main lifespan report and the /channels/remove-orphan
+    endpoint).
     """
     known = {ch["channel_id"] for ch in db.get_channels() if ch["channel_id"]}
     known |= {ch["channel_id"] for ch in db.get_unsubscribed_channels()}
