@@ -76,12 +76,20 @@ All configuration is via environment variables in `docker-compose.yml`. Credenti
 | Variable | Default | Description |
 |---|---|---|
 | `BASE_URL` | `http://localhost:8000` | Public URL of your app — used in feed and audio URLs |
-| `AUTH_USER` | *(none)* | Management UI username |
-| `AUTH_PASS` | *(none)* | Management UI password |
+| `AUTH_USER` | *(none)* | Management UI username (single-user; ignored if `AUTH_USERS` is set) |
+| `AUTH_PASS` | *(none)* | Management UI password (single-user; ignored if `AUTH_USERS` is set) |
+| `AUTH_USERS` | *(none)* | Multi-user credentials, e.g. `alice:pass1,bob:pass2` — takes precedence over `AUTH_USER`/`AUTH_PASS` |
 | `DATA_DIR` | `/data` | Where audio, thumbnails, and the database are stored |
 | `MAX_EPISODES_PER_CHANNEL` | `20` | How many episodes to keep per channel |
 | `POLL_INTERVAL_HOURS` | `2` | How often to check subscribed channels for new videos |
+| `POLL_CONCURRENCY` | `2` | Max channels polled at once by "poll all"/"poll selected" |
 | `COOKIES_FILE` | *(none)* | Path to YouTube cookies file (upload via UI, then uncomment) |
+| `SMTP_HOST` | *(none)* | SMTP server for cookie-expiry email alerts (e.g. `smtp.gmail.com`) |
+| `SMTP_PORT` | `587` | SMTP port |
+| `SMTP_USER` | *(none)* | SMTP username |
+| `SMTP_PASS` | *(none)* | SMTP password (for Gmail, an [App Password](https://myaccount.google.com/apppasswords)) |
+| `SMTP_FROM` | `SMTP_USER` | From address for alert emails |
+| `ALERT_EMAIL` | `ericfaris@gmail.com` | Where cookie-expiry and poll-failure alerts are sent |
 
 ### Important notes
 - ⚠️ **Always set credentials before exposing the app.** If neither `AUTH_USERS` nor `AUTH_USER`/`AUTH_PASS` is set, authentication is **disabled** and the entire management UI — including channel management and cookie upload — is open to anyone who can reach it. Set `AUTH_USERS=alice:pass1,bob:pass2` (preferred) or `AUTH_USER`/`AUTH_PASS` whenever the app is reachable beyond localhost.
@@ -89,6 +97,7 @@ All configuration is via environment variables in `docker-compose.yml`. Credenti
 - The port is bound to `127.0.0.1` so the app is only reachable from localhost — external traffic must go through a reverse proxy or tunnel (e.g. Cloudflare Tunnel or Tailscale).
 - The management UI (`/`) requires Basic Auth. Feed and audio endpoints (`/feed/`, `/audio/`) are public so podcast apps can access them without credentials.
 - YouTube cookies expire every few weeks. When downloads start failing, re-upload cookies via the management UI and uncomment `COOKIES_FILE`.
+- The container has a Docker `HEALTHCHECK` (mirrored in `docker-compose.yml`) that hits `/health`. With `restart: unless-stopped`, Docker Compose does **not** automatically restart a container just because it's marked unhealthy — the healthcheck only makes the status visible (`docker compose ps`, `docker inspect`); watch for it (e.g. with an external monitor) if you want an actual restart-on-unhealthy.
 
 ---
 
@@ -112,6 +121,9 @@ Episodes downloaded individually without subscribing to the channel. These have 
 |---|---|
 | **Copy** | Copies the RSS feed URL to your clipboard |
 | **Subscribe** | Promotes the channel to a full subscription and starts polling it |
+
+### Orphaned Data
+Removing a channel resolves its internal `channel_id` to delete the matching episodes and files — if that resolution ever fails (a URL variant, or a channel removed before it was first successfully polled), the episodes/files are left behind with no channel row pointing at them. Slipcast checks for this on startup (logged, never auto-deleted) and lists anything found under **Orphaned data** in the dashboard, with a **Delete** button per entry.
 
 ### Add Channel
 Paste any YouTube channel URL or handle and click **Add Channel**. The channel is immediately polled in the background.
@@ -180,13 +192,15 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
 | `GET` | `/feed/<channel_id>.xml` | None | RSS feed for a channel |
 | `GET` | `/audio/<channel_id>/<file>.mp3` | None | Audio file stream |
 | `GET` | `/thumbnails/<channel_id>/<file>.jpg` | None | Thumbnail image |
-| `GET` | `/health` | None | Health check |
+| `GET` | `/health` | None | Health check — 200 `{"status":"ok",...}` when healthy, 503 `{"status":"degraded",...}` (with a `checks`/`problems` breakdown) if the scheduler isn't running, polling has gone stale (no run in ~3x `POLL_INTERVAL_HOURS`, past an initial startup grace period), or cookies are missing/expired |
 | `GET` | `/add?channel=<url>` | Required | Add a channel via shareable link |
 | `GET` | `/download?url=<url>` | Required | Download an episode via shareable link |
 | `POST` | `/channels/add` | Required | Add a channel (form) |
 | `POST` | `/channels/remove` | Required | Remove a channel (form) |
 | `POST` | `/channels/poll` | Required | Trigger immediate poll (form) |
 | `POST` | `/channels/subscribe` | Required | Promote one-off to subscription (form) |
+| `POST` | `/channels/remove-unsubscribed` | Required | Remove a one-off (unsubscribed) channel and its files (form) |
+| `POST` | `/channels/remove-orphan` | Required | Delete leftover data for a channel with no owning row — see Orphaned Data below (form) |
 | `POST` | `/episodes/download` | Required | Download a specific episode (form) |
 | `POST` | `/auth/cookies` | Required | Upload YouTube cookies file (max 5 MB) |
 

@@ -5,6 +5,12 @@ from app.config import DB_PATH
 
 def init_db():
     with get_conn() as conn:
+        # WAL lets readers (e.g. /api/state, polled every few seconds by the
+        # dashboard) proceed without blocking on a writer, and vice versa —
+        # important once multiple poll threads can write concurrently (see
+        # POLL_CONCURRENCY). It's a durable, one-time setting stored in the DB
+        # file itself, so this only needs to run at init, not per connection.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 url          TEXT PRIMARY KEY,
@@ -56,6 +62,10 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_poll_runs_started ON poll_runs(started_at DESC)")
+        # episodes is filtered by channel_id on every /api/state, feed build, and
+        # episode-listing request — without an index each of those is a full
+        # table scan.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_channel_id ON episodes(channel_id)")
         # migrate existing DBs
         cols = {r[1] for r in conn.execute("PRAGMA table_info(episodes)").fetchall()}
         if "thumbnail" not in cols:
@@ -66,9 +76,19 @@ def init_db():
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # WAL still serializes writers; without a busy_timeout a second writer
+    # (concurrent poll threads, see POLL_CONCURRENCY) gets an immediate
+    # "database is locked" instead of waiting briefly for the first to finish.
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
+    except Exception:
+        # Don't rely on sqlite3's implicit rollback-on-close — be explicit so a
+        # half-applied multi-statement write (e.g. record_poll_run's insert +
+        # prune) never gets partially committed on close.
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -96,6 +116,42 @@ def get_all_channel_ids() -> list[str]:
     with get_conn() as conn:
         rows = conn.execute("SELECT DISTINCT channel_id FROM episodes").fetchall()
         return [r["channel_id"] for r in rows]
+
+
+def episode_counts() -> dict[str, int]:
+    """{channel_id: episode count} for every channel, in one query.
+
+    /api/state is polled by the dashboard every few seconds and previously
+    called get_episodes() (loads every row) once per channel to get a count —
+    O(channels * episodes) work on every poll of the poll endpoint itself.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT channel_id, COUNT(*) AS n FROM episodes GROUP BY channel_id"
+        ).fetchall()
+        return {r["channel_id"]: r["n"] for r in rows}
+
+
+def orphan_channel_ids() -> set[str]:
+    """channel_ids referenced by episodes but owned by neither channels nor
+    unsubscribed_channels.
+
+    This happens when a channels row is deleted without its channel_id ever
+    being resolved (see main._resolve_channel_id_for_removal) — the episodes,
+    skip_videos, and on-disk files are left behind with no row and no UI to
+    find them. This is the DB-side half of orphan detection; app.downloader
+    also checks for on-disk directories with no matching row at all (a channel
+    whose channel_id was resolved and removed, but whose files failed to
+    delete, or that never had an episode row to begin with).
+    """
+    with get_conn() as conn:
+        ep_ids = {r["channel_id"] for r in
+                  conn.execute("SELECT DISTINCT channel_id FROM episodes").fetchall()}
+        known = {r["channel_id"] for r in
+                 conn.execute("SELECT channel_id FROM channels WHERE channel_id IS NOT NULL").fetchall()}
+        known |= {r["channel_id"] for r in
+                  conn.execute("SELECT channel_id FROM unsubscribed_channels").fetchall()}
+    return ep_ids - known
 
 
 def delete_episode(episode_id: str):

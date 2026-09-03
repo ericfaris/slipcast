@@ -129,3 +129,12 @@ def test_auth_error_detection():
     assert _looks_like_auth_error("Please use --cookies for this video")
     assert _looks_like_auth_error("")  is False
     assert _looks_like_auth_error("HTTP Error 404: Not Found") is False
+
+
+def test_auth_error_detection_ignores_incidental_cookies_mentions():
+    # Regression: the signal used to be the bare substring "cookies", so any
+    # error merely mentioning the word (not actually an auth failure) wrongly
+    # triggered a cookie-expiry email.
+    assert not _looks_like_auth_error("Unable to parse cookies from browser profile")
+    assert not _looks_like_auth_error("This video mentions cookies in its description")
+    assert _looks_like_auth_error("The provided YouTube account cookies are no longer valid")

@@ -184,6 +184,36 @@ function oneoffCard(ch) {
     el('div', { class: 'ch-actions' }, [
       el('button', { class: 'btn btn-ghost btn-sm', type: 'button', text: 'Share', onclick: () => openShare(ch) }),
       el('button', { class: 'btn btn-primary btn-sm', type: 'button', text: 'Subscribe', onclick: () => act(() => postForm('/channels/subscribe', fd({ channel_id: ch.channel_id, channel_name: ch.name }))) }),
+      el('button', {
+        class: 'btn btn-danger-ghost btn-sm', type: 'button', text: 'Remove',
+        onclick: () => { if (confirm(`Remove ${ch.name}? Downloaded audio will be deleted.`)) act(() => postForm('/channels/remove-unsubscribed', fd({ channel_id: ch.channel_id }))); },
+      }),
+    ]),
+  ]);
+}
+
+function fmtBytes(n) {
+  if (!n) return '0 MB';
+  const mb = n / 1048576;
+  return mb >= 1 ? `${mb.toFixed(mb < 10 ? 1 : 0)} MB` : `${Math.round(n / 1024)} KB`;
+}
+
+function orphanCard(o) {
+  return el('div', { class: 'card ch-card' }, [
+    el('div', { class: 'ch-top' }, [
+      avatar(o.channel_name, null),
+      el('div', { class: 'ch-meta' }, [
+        el('div', { class: 'ch-name', title: o.channel_name, text: o.channel_name }),
+        el('div', { class: 'ch-sub' }, [
+          el('span', { class: 'ep-badge', text: `${o.episode_count} episode${o.episode_count === 1 ? '' : 's'} · ${fmtBytes(o.bytes)}` }),
+        ]),
+      ]),
+    ]),
+    el('div', { class: 'ch-actions' }, [
+      el('button', {
+        class: 'btn btn-danger-ghost btn-sm', type: 'button', text: 'Delete',
+        onclick: () => { if (confirm(`Permanently delete orphaned data for "${o.channel_name}"? This cannot be undone.`)) act(() => postForm('/channels/remove-orphan', fd({ channel_id: o.channel_id }))); },
+      }),
     ]),
   ]);
 }
@@ -253,6 +283,17 @@ function render() {
   og.replaceChildren();
   if (d.unsubscribed.length === 0) og.appendChild(emptyCard('🎯', 'Nothing here', 'One-off video downloads will appear here. Subscribe to keep getting new episodes.'));
   else d.unsubscribed.forEach((ch) => og.appendChild(oneoffCard(ch)));
+
+  // orphaned data — only shown when there's something to clean up
+  const orphans = d.orphans || [];
+  const orphSection = $('#orphans-section');
+  orphSection.hidden = orphans.length === 0;
+  if (orphans.length) {
+    $('#orphans-count').textContent = orphans.length;
+    const ogrid = $('#orphans-grid');
+    ogrid.replaceChildren();
+    orphans.forEach((o) => ogrid.appendChild(orphanCard(o)));
+  }
 }
 
 function renderCookies(c, email) {

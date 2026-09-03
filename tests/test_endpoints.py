@@ -4,6 +4,8 @@ These call the route handlers directly so we don't boot the scheduler/app.
 """
 import asyncio
 import io
+import os
+import time
 
 import pytest
 from fastapi import HTTPException
@@ -77,10 +79,93 @@ def test_test_email_sends_when_configured(monkeypatch):
     assert sent["f"] is True  # forced past the cooldown
 
 
-def test_health_reports_version():
-    body = main.health()
+def _health_body(resp):
+    import json
+    return json.loads(bytes(resp.body))
+
+
+def test_health_reports_version_when_healthy(monkeypatch):
+    # No channels configured -> polling check is a trivial pass; scheduler up;
+    # cookies valid — every check should pass and report 200/"ok".
+    db.init_db()
+    monkeypatch.setattr(db, "get_channels", lambda: [])
+
+    class _FakeSched:
+        running = True
+    monkeypatch.setattr(main, "_scheduler", _FakeSched())
+    monkeypatch.setattr(main, "cookies_status", lambda: {"present": True, "expired": False})
+
+    resp = main.health()
+    body = _health_body(resp)
+    assert resp.status_code == 200
     assert body["status"] == "ok"
     assert body["version"] == main.VERSION
+    assert body["checks"]["scheduler"] == "running"
+
+
+def test_health_degraded_when_scheduler_missing(monkeypatch):
+    db.init_db()
+    monkeypatch.setattr(db, "get_channels", lambda: [])
+    monkeypatch.setattr(main, "_scheduler", None)
+    monkeypatch.setattr(main, "cookies_status", lambda: {"present": True, "expired": False})
+
+    resp = main.health()
+    body = _health_body(resp)
+    assert resp.status_code == 503
+    assert body["status"] == "degraded"
+    assert "scheduler is not running" in body["problems"]
+
+
+def test_health_degraded_when_cookies_missing(monkeypatch):
+    db.init_db()
+    monkeypatch.setattr(db, "get_channels", lambda: [])
+
+    class _FakeSched:
+        running = True
+    monkeypatch.setattr(main, "_scheduler", _FakeSched())
+    monkeypatch.setattr(main, "cookies_status", lambda: {"present": False, "expired": False})
+
+    resp = main.health()
+    body = _health_body(resp)
+    assert resp.status_code == 503
+    assert body["status"] == "degraded"
+    assert any("cookies" in p for p in body["problems"])
+
+
+def test_health_not_degraded_before_first_poll_grace_period(monkeypatch):
+    # A channel is configured but no poll_runs row exists yet, and the process
+    # "just started" — must not report degraded before the first poll can run.
+    monkeypatch.setattr(db, "get_channels", lambda: [{"url": "https://x", "channel_id": None}])
+    monkeypatch.setattr(db, "get_recent_poll_runs", lambda limit=1: [])
+
+    class _FakeSched:
+        running = True
+    monkeypatch.setattr(main, "_scheduler", _FakeSched())
+    monkeypatch.setattr(main, "cookies_status", lambda: {"present": True, "expired": False})
+    monkeypatch.setattr(main, "_STARTED_MONOTONIC", time.monotonic())
+
+    resp = main.health()
+    body = _health_body(resp)
+    assert resp.status_code == 200
+    assert body["checks"]["polling"] == "starting up"
+
+
+def test_health_degraded_when_no_poll_ever_completed_past_grace(monkeypatch):
+    monkeypatch.setattr(db, "get_channels", lambda: [{"url": "https://x", "channel_id": None}])
+    monkeypatch.setattr(db, "get_recent_poll_runs", lambda limit=1: [])
+    monkeypatch.setattr(main, "POLL_INTERVAL_HOURS", 1)
+
+    class _FakeSched:
+        running = True
+    monkeypatch.setattr(main, "_scheduler", _FakeSched())
+    monkeypatch.setattr(main, "cookies_status", lambda: {"present": True, "expired": False})
+    # Well past the 3x POLL_INTERVAL_HOURS grace period.
+    monkeypatch.setattr(main, "_STARTED_MONOTONIC", time.monotonic() - 999999)
+
+    resp = main.health()
+    body = _health_body(resp)
+    assert resp.status_code == 503
+    assert "no poll has completed since startup" in body["problems"]
 
 
 def test_served_version_matches_package():
@@ -105,7 +190,7 @@ def test_api_state_shape():
     resp = main.api_state()
     import json
     data = json.loads(resp.body)
-    for key in ("channels", "unsubscribed", "cookies", "email", "next_poll", "jobs", "version"):
+    for key in ("channels", "unsubscribed", "orphans", "cookies", "email", "next_poll", "jobs", "version"):
         assert key in data
 
 
@@ -309,3 +394,130 @@ def test_thumbnail_blocks_disallowed_urls(url):
 ])
 def test_video_id_validation(vid, ok):
     assert bool(downloader._VIDEO_ID_RE.match(vid)) is ok
+
+
+# --- orphaned channel data / removal endpoints -------------------------------
+
+CID = "UCabc12345678901234567890"
+
+
+def _ep(i, cid=CID):
+    return {
+        "id": f"v{i:03d}", "channel_id": cid, "channel_name": "C",
+        "title": f"t{i}", "description": "",
+        "published": f"2026-06-{(i % 28) + 1:02d}T00:00:00+00:00",
+        "duration": 1, "filename": f"v{i:03d}.mp3", "filesize": 1, "thumbnail": None,
+    }
+
+
+def _setup_tmp_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setattr(main, "AUDIO_DIR", str(tmp_path / "audio"))
+    monkeypatch.setattr(main, "THUMBNAIL_DIR", str(tmp_path / "thumb"))
+    monkeypatch.setattr(downloader, "AUDIO_DIR", str(tmp_path / "audio"))
+    monkeypatch.setattr(downloader, "THUMBNAIL_DIR", str(tmp_path / "thumb"))
+    db.init_db()
+
+
+def test_resolve_channel_id_exact_url_match(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    url = "https://www.youtube.com/@A"
+    db.add_channel(url)
+    db.update_channel_meta(url, CID, "A")
+    assert main._resolve_channel_id_for_removal(url) == CID
+
+
+def test_resolve_channel_id_falls_back_to_normalized_match(tmp_path, monkeypatch):
+    """Regression: a trailing-slash/tracking-query URL variant must still
+    resolve to the same channel_id as the one stored at add-time."""
+    _setup_tmp_db(tmp_path, monkeypatch)
+    stored_url = "https://www.youtube.com/@A"
+    db.add_channel(stored_url)
+    db.update_channel_meta(stored_url, CID, "A")
+    variant = "https://www.youtube.com/@A?si=trackingjunk"
+    assert main._resolve_channel_id_for_removal(variant) == CID
+
+
+def test_resolve_channel_id_returns_none_when_unresolvable(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    assert main._resolve_channel_id_for_removal("https://www.youtube.com/@Ghost") is None
+
+
+def test_remove_one_cleans_up_episodes_and_files(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    url = "https://www.youtube.com/@A"
+    db.add_channel(url)
+    db.update_channel_meta(url, CID, "A")
+    db.upsert_episode(_ep(0))
+    audio_dir = downloader._audio_dir_for(CID)
+    open(os.path.join(audio_dir, "v000.mp3"), "wb").close()
+
+    main._remove_one(url)
+
+    assert db.get_channels() == []
+    assert db.get_episodes(CID) == []
+    assert not os.path.exists(audio_dir)
+
+
+def test_remove_unsubscribed_endpoint(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    db.upsert_unsubscribed_channel(CID, "A")
+    db.upsert_episode(_ep(0))
+    audio_dir = downloader._audio_dir_for(CID)
+    open(os.path.join(audio_dir, "v000.mp3"), "wb").close()
+
+    resp = main.remove_unsubscribed_channel_endpoint(channel_id=CID)
+    assert resp.status_code == 200
+    assert db.get_unsubscribed_channels() == []
+    assert db.get_episodes(CID) == []
+    assert not os.path.exists(audio_dir)
+
+
+def test_remove_unsubscribed_endpoint_rejects_bad_id():
+    with pytest.raises(HTTPException) as exc:
+        main.remove_unsubscribed_channel_endpoint(channel_id="../etc/passwd")
+    assert exc.value.status_code == 400
+
+
+def test_remove_orphan_endpoint(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    db.upsert_episode(_ep(0))  # orphan: no channels/unsubscribed row at all
+    audio_dir = downloader._audio_dir_for(CID)
+    open(os.path.join(audio_dir, "v000.mp3"), "wb").close()
+    assert downloader.find_orphan_channels() != []
+
+    resp = main.remove_orphan_channel(channel_id=CID)
+    assert resp.status_code == 200
+    assert db.get_episodes(CID) == []
+    assert not os.path.exists(audio_dir)
+    assert downloader.find_orphan_channels() == []
+
+
+def test_remove_orphan_endpoint_rejects_bad_id():
+    with pytest.raises(HTTPException) as exc:
+        main.remove_orphan_channel(channel_id="../etc/passwd")
+    assert exc.value.status_code == 400
+
+
+def test_api_state_includes_orphans(tmp_path, monkeypatch):
+    import json
+    _setup_tmp_db(tmp_path, monkeypatch)
+    db.upsert_episode(_ep(0))
+    data = json.loads(main.api_state().body)
+    assert any(o["channel_id"] == CID for o in data["orphans"])
+
+
+# --- poll-all/poll-bulk use a bounded executor, not a thread per channel ----
+
+def test_poll_all_now_submits_to_executor_not_raw_threads(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    db.add_channel("https://www.youtube.com/@A")
+    db.add_channel("https://www.youtube.com/@B")
+
+    submitted = []
+    monkeypatch.setattr(main._poll_executor, "submit", lambda fn, *a: submitted.append((fn, a)))
+
+    resp = main.poll_all_now()
+    assert resp.status_code == 200
+    assert len(submitted) == 2
+    assert all(fn is main._run_poll for fn, _ in submitted)

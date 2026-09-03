@@ -5,6 +5,16 @@ services:
     build: .
     image: ericfaris/slipcast:latest
     restart: unless-stopped
+    # Reports actual health (scheduler up, polling not stalled, cookies valid)
+    # via /health — see app/main.py. NOTE: with restart: unless-stopped, Compose
+    # does NOT automatically restart a container Docker marks "unhealthy"; this
+    # only makes the status visible (`docker compose ps`, `docker inspect`).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 1m
+      timeout: 10s
+      start_period: 2m
+      retries: 3
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -25,6 +35,9 @@ services:
 
       # How often to check channels for new videos (in hours)
       - POLL_INTERVAL_HOURS=2
+
+      # Max channels polled at once by "poll all"/"poll selected"
+      - POLL_CONCURRENCY=2
 
       # Internal data directory — leave this as-is
       - DATA_DIR=/data
