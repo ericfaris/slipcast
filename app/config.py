@@ -51,3 +51,22 @@ ALERT_COOLDOWN_HOURS = int(os.environ.get("ALERT_COOLDOWN_HOURS", "24"))
 # Warn by email this many days before the cookies file's parsed expiry date.
 COOKIE_EXPIRY_WARN_DAYS = int(os.environ.get("COOKIE_EXPIRY_WARN_DAYS", "7"))
 
+# --- Audio format ------------------------------------------------------------
+# Codec/bitrate for the audio yt-dlp extracts. "mp3" (the default) is what every
+# podcast app understands; "opus" is roughly half the size at equivalent quality
+# but is not universally supported (Apple Podcasts and Pocket Casts in
+# particular). Changing this affects NEW downloads only — episodes already on
+# disk keep their original format, so a feed can legitimately mix the two.
+AUDIO_CODEC = os.environ.get("AUDIO_CODEC", "mp3").strip().lower()
+AUDIO_BITRATE_KBPS = os.environ.get("AUDIO_BITRATE_KBPS", "128").strip()
+
+# --- Retention ---------------------------------------------------------------
+# Drop episodes older than this many days, on top of the MAX_EPISODES_PER_CHANNEL
+# count cap. 0 disables age-based pruning (the default — count cap only).
+MAX_EPISODE_AGE_DAYS = int(os.environ.get("MAX_EPISODE_AGE_DAYS", "0"))
+# Don't download channel videos longer than this many minutes — a single
+# multi-hour livestream can consume more disk than a whole channel of normal
+# uploads. 0 disables the check. One-off downloads are exempt (an explicit
+# request); they only log a warning.
+MAX_EPISODE_DURATION_MINUTES = int(os.environ.get("MAX_EPISODE_DURATION_MINUTES", "0"))
+

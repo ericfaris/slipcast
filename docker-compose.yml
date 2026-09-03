@@ -37,6 +37,15 @@ services:
       # How many episodes to keep per channel (older ones are pruned)
       - MAX_EPISODES_PER_CHANNEL=20
 
+      # Also prune episodes older than this many days, on top of the count cap
+      # above (0 disables — count cap only).
+      - MAX_EPISODE_AGE_DAYS=0
+
+      # Don't download channel videos longer than this many minutes — catches
+      # multi-hour livestreams before they eat a channel's disk budget (0
+      # disables). One-off downloads are exempt; they only log a warning.
+      - MAX_EPISODE_DURATION_MINUTES=0
+
       # Below this many GB free on the data volume, the oldest episodes across
       # all channels are deleted before polling (0 disables). Always emails.
       - MIN_FREE_DISK_GB=2
@@ -46,6 +55,14 @@ services:
 
       # Max channels polled at once by "poll all"/"poll selected"
       - POLL_CONCURRENCY=2
+
+      # Audio codec/bitrate for new downloads. "opus" is roughly half the size
+      # of mp3 at equivalent quality but isn't universally supported by podcast
+      # apps (notably Apple Podcasts, Pocket Casts) — check before switching.
+      # Changing this affects new downloads only; existing files keep their
+      # original format.
+      - AUDIO_CODEC=mp3
+      - AUDIO_BITRATE_KBPS=128
 
       # Internal data directory — leave this as-is
       - DATA_DIR=/data

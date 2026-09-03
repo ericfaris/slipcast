@@ -29,7 +29,7 @@ from app.config import (
 )
 from app.downloader import (
     cookies_status, download_single, find_orphan_channels, poll_all,
-    poll_channel, remove_channel_data, valid_cookie_file,
+    poll_channel, remove_channel_data, storage_usage, valid_cookie_file,
 )
 from app.feed import build_feed
 
@@ -528,6 +528,7 @@ _PAGE = """<!DOCTYPE html>
         <section class="section" aria-labelledby="subs-h">
             <div class="section-head">
                 <h2 id="subs-h">Subscribed channels <span id="subs-count" class="count-pill"></span></h2>
+                <span id="subs-storage" class="pill"></span>
             </div>
 
             <form id="add-form" class="inline-form" autocomplete="off">
@@ -692,6 +693,12 @@ def api_state():
             "error": r["error"],
         }
 
+    sizes, total_bytes = {}, 0
+    try:
+        sizes, total_bytes = storage_usage()
+    except Exception:  # noqa: BLE001 — storage figures must never break the dashboard
+        logger.exception("Failed to compute storage usage")
+
     channels = []
     for ch in db.get_channels():
         cid = ch["channel_id"]
@@ -700,6 +707,7 @@ def api_state():
             "channel_id": cid,
             "name": ch["channel_name"] or ch["url"],
             "episodes": counts.get(cid, 0) if cid else 0,
+            "bytes": sizes.get(cid, 0) if cid else 0,
             "feed_url": _feed_url(cid) if cid else None,
             "thumbnail": _thumb_url(cid) if cid else None,
             "added_at": ch["added_at"],
@@ -713,6 +721,7 @@ def api_state():
             "channel_id": cid,
             "name": ch["channel_name"] or cid,
             "episodes": counts.get(cid, 0),
+            "bytes": sizes.get(cid, 0),
             "feed_url": _feed_url(cid),
             "thumbnail": _thumb_url(cid),
         })
@@ -727,6 +736,7 @@ def api_state():
         "channels": channels,
         "unsubscribed": unsubscribed,
         "orphans": orphans,
+        "total_bytes": total_bytes,
         "cookies": cookies_status(),
         "email": {"configured": notify._smtp_configured(), "address": ALERT_EMAIL},
         "next_poll": _next_poll_label(),

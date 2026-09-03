@@ -14,10 +14,14 @@ import yt_dlp
 from app import database as db
 from app import notify
 from app.config import (
+    AUDIO_BITRATE_KBPS,
+    AUDIO_CODEC,
     AUDIO_DIR,
     COOKIE_EXPIRY_WARN_DAYS,
     COOKIES_FILE,
     DATA_DIR,
+    MAX_EPISODE_AGE_DAYS,
+    MAX_EPISODE_DURATION_MINUTES,
     MAX_EPISODES_PER_CHANNEL,
     MIN_FREE_DISK_GB,
     THUMBNAIL_DIR,
@@ -101,7 +105,43 @@ class MemberOnlyError(Exception):
     """Raised when a video can't be downloaded because it's members-only."""
 
 
+class TooLongError(Exception):
+    """Raised when a video exceeds MAX_EPISODE_DURATION_MINUTES."""
+
+
 logger = logging.getLogger(__name__)
+
+# yt-dlp's FFmpegExtractAudio postprocessor maps each preferredcodec to a fixed
+# output extension (see ACODECS in yt_dlp/postprocessor/ffmpeg.py): "mp3" ->
+# .mp3, "opus" -> .opus (an Ogg container). Anything we don't know how to name
+# is not worth guessing at, so we fall back to mp3.
+_CODEC_EXTENSIONS = {"mp3": "mp3", "opus": "opus"}
+# Extensions a previously-downloaded episode may already carry. The existence
+# check consults all of them so switching AUDIO_CODEC doesn't make every
+# existing episode look missing and re-download the whole library.
+_KNOWN_AUDIO_EXTENSIONS = ("mp3", "opus")
+
+
+def _audio_codec() -> str:
+    if AUDIO_CODEC not in _CODEC_EXTENSIONS:
+        logger.warning("Unsupported AUDIO_CODEC %r — falling back to mp3", AUDIO_CODEC)
+        return "mp3"
+    return AUDIO_CODEC
+
+
+def _audio_ext() -> str:
+    return _CODEC_EXTENSIONS[_audio_codec()]
+
+
+def _exceeds_duration_cap(duration) -> bool:
+    """True if duration (seconds, possibly None) is over the configured cap.
+
+    A missing duration is never "too long" — flat channel listings omit it for
+    live streams and premieres, which the post-download check catches instead.
+    """
+    if not MAX_EPISODE_DURATION_MINUTES or not duration:
+        return False
+    return duration > MAX_EPISODE_DURATION_MINUTES * 60
 
 
 def _download_thumbnail(url: str, dest: str) -> bool:
@@ -302,8 +342,8 @@ def _ydl_opts(channel_id: str) -> dict:
         "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "128",
+            "preferredcodec": _audio_codec(),
+            "preferredquality": AUDIO_BITRATE_KBPS,
         }],
         "outtmpl": os.path.join(_audio_dir_for(channel_id), "%(id)s.%(ext)s"),
         "extract_flat": False,
@@ -341,7 +381,8 @@ def _fetch_channel_entries(channel_url: str, max_entries: int) -> tuple[list[dic
     return entries, channel_id, channel_name
 
 
-def _download_entry(entry: dict, channel_id: str, channel_name: str) -> dict | None:
+def _download_entry(entry: dict, channel_id: str, channel_name: str, *,
+                    enforce_duration: bool = True) -> dict | None:
     video_id = entry.get("id")
     if not video_id:
         return None
@@ -350,9 +391,16 @@ def _download_entry(entry: dict, channel_id: str, channel_name: str) -> dict | N
         return None
 
     audio_dir = _audio_dir_for(channel_id)
-    expected_file = os.path.join(audio_dir, f"{video_id}.mp3")
-
-    if os.path.exists(expected_file):
+    expected_file = os.path.join(audio_dir, f"{video_id}.{_audio_ext()}")
+    # An episode downloaded before AUDIO_CODEC changed still lives under its
+    # original extension; treat any of them as "already have it" so flipping the
+    # codec doesn't re-download an entire library.
+    existing = next(
+        (p for p in (os.path.join(audio_dir, f"{video_id}.{e}") for e in _KNOWN_AUDIO_EXTENSIONS)
+         if os.path.exists(p)),
+        None,
+    )
+    if existing:
         logger.debug("Already downloaded: %s", video_id)
         return None
 
@@ -372,6 +420,15 @@ def _download_entry(entry: dict, channel_id: str, channel_name: str) -> dict | N
     if not os.path.exists(expected_file):
         logger.warning("Expected file not found after download: %s", expected_file)
         return None
+
+    if enforce_duration and _exceeds_duration_cap(info.get("duration")):
+        # Flat channel listings omit duration for live streams/premieres, so
+        # this is the only reliable point to catch them. Bin the file we just
+        # paid for and let the caller remember not to try again.
+        logger.info("Discarding %s — %ss exceeds the %d-minute cap",
+                    video_id, info.get("duration"), MAX_EPISODE_DURATION_MINUTES)
+        _remove_if_exists(expected_file)
+        raise TooLongError(video_id)
 
     published = info.get("upload_date", "")
     if published:
@@ -407,10 +464,29 @@ def _remove_if_exists(path: str) -> None:
         logger.info("Pruned %s", path)
 
 
+def _aged_out(ep) -> bool:
+    """True if an episode's published date is past MAX_EPISODE_AGE_DAYS.
+
+    An unparseable date is never treated as aged out — a bad timestamp must not
+    silently delete audio.
+    """
+    if not MAX_EPISODE_AGE_DAYS:
+        return False
+    try:
+        pub = datetime.fromisoformat(ep["published"])
+    except (ValueError, TypeError):
+        return False
+    if pub.tzinfo is None:
+        pub = pub.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - pub).days > MAX_EPISODE_AGE_DAYS
+
+
 def _prune_channel(channel_id: str):
     episodes = db.get_episodes(channel_id)
-    to_delete = episodes[MAX_EPISODES_PER_CHANNEL:]
-    for ep in to_delete:
+    over_cap = episodes[MAX_EPISODES_PER_CHANNEL:]
+    # Both caps apply: an episode inside the count cap can still be too old.
+    aged = [ep for ep in episodes[:MAX_EPISODES_PER_CHANNEL] if _aged_out(ep)]
+    for ep, reason in [(e, "pruned") for e in over_cap] + [(e, "aged_out") for e in aged]:
         _remove_if_exists(os.path.join(_audio_dir_for(channel_id), ep["filename"]))
         if ep["thumbnail"]:
             _remove_if_exists(os.path.join(_thumbnail_dir_for(channel_id), ep["thumbnail"]))
@@ -421,7 +497,7 @@ def _prune_channel(channel_id: str):
         # have an upload date that puts it past the cap. Without this, the
         # download loop (channel order) and prune (upload-date order) fight each
         # other and re-download the same videos every poll forever.
-        db.add_skip_video(ep["id"], channel_id, "pruned")
+        db.add_skip_video(ep["id"], channel_id, reason)
     # Even with the DB capped, disk can hold files the DB no longer references:
     # thumbnails that predate thumbnail-pruning, audio left by an interrupted
     # prune, or yt-dlp `.part`/temp leftovers. Sweep them so only the current
@@ -441,6 +517,13 @@ def _prune_channel(channel_id: str):
 # so recency is a reliable enough signal: skip temp-shaped files touched
 # recently, delete ones old enough that they can't still be in progress.
 _YTDLP_TEMP_SUFFIXES = (".part", ".ytdl", ".temp", ".tmp")
+# Note ".opus" is in here even though it's also a possible *final* extension
+# under AUDIO_CODEC=opus. That's intentional, not an oversight: _sweep_orphan_files
+# checks keep_audio membership before this temp-suffix test, so a referenced
+# .opus episode is never swept regardless of this list, and an unreferenced one
+# (mid-download, DB row not yet written) still gets the grace-period protection
+# below. Removing ".opus" here would make an in-flight opus download deletable
+# the instant a concurrent sweep runs — don't.
 _YTDLP_PRECONVERT_SUFFIXES = (".m4a", ".webm", ".opus", ".aac", ".ogg", ".mp4", ".mkv")
 _RECENT_FILE_GRACE_SECONDS = 3600
 
@@ -592,6 +675,11 @@ def _poll_channel_locked(channel_url: str):
                 if video_id:
                     db.add_skip_video(video_id, channel_id, "members_only")
                 continue
+            if _exceeds_duration_cap(entry.get("duration")):
+                logger.debug("Skipping over-long video: %s", video_id)
+                if video_id:
+                    db.add_skip_video(video_id, channel_id, "too_long")
+                continue
             considered += 1
             try:
                 result = _download_entry(entry, channel_id, channel_name)
@@ -602,6 +690,12 @@ def _poll_channel_locked(channel_url: str):
                 if video_id:
                     db.add_skip_video(video_id, channel_id, "members_only")
                 logger.debug("Recorded members-only skip: %s", video_id)
+                considered -= 1
+                continue
+            except TooLongError:
+                # Recorded so future polls skip it before spending the download.
+                if video_id:
+                    db.add_skip_video(video_id, channel_id, "too_long")
                 considered -= 1
                 continue
             except Exception as exc:  # noqa: BLE001
@@ -819,8 +913,14 @@ def download_single(video_url: str, subscribe: bool = False):
         if not any(ch["channel_id"] == channel_id for ch in channels):
             db.upsert_unsubscribed_channel(channel_id, channel_name)
 
+    if _exceeds_duration_cap(info.get("duration")):
+        logger.warning("One-off download of %s is longer than the %d-minute cap "
+                       "— downloading anyway (explicit request)",
+                       video_id, MAX_EPISODE_DURATION_MINUTES)
+
     try:
-        result = _download_entry({"id": video_id}, channel_id, channel_name)
+        result = _download_entry({"id": video_id}, channel_id, channel_name,
+                                 enforce_duration=False)
     except MemberOnlyError:
         # One-off downloads are explicit user requests — don't record a skip,
         # just report that membership is required.
@@ -861,6 +961,27 @@ def _dir_bytes(path: str) -> int:
     return total
 
 
+def channel_bytes(channel_id: str) -> int:
+    """Bytes on disk for one channel — its audio plus its thumbnails."""
+    return (_dir_bytes(os.path.join(AUDIO_DIR, channel_id))
+            + _dir_bytes(os.path.join(THUMBNAIL_DIR, channel_id)))
+
+
+def storage_usage() -> tuple[dict[str, int], int]:
+    """Return (bytes per channel_id, total bytes) across every channel directory.
+
+    The total covers every directory under AUDIO_DIR/THUMBNAIL_DIR, including
+    channels the DB no longer owns (see find_orphan_channels), so it matches
+    what the volume is actually holding rather than only what's subscribed.
+    """
+    ids: set[str] = set()
+    for base in (AUDIO_DIR, THUMBNAIL_DIR):
+        if os.path.isdir(base):
+            ids.update(n for n in os.listdir(base) if os.path.isdir(os.path.join(base, n)))
+    per_channel = {cid: channel_bytes(cid) for cid in ids}
+    return per_channel, sum(per_channel.values())
+
+
 def find_orphan_channels() -> list[dict]:
     """Find channel data (episodes rows and/or on-disk directories) owned by
     neither a `channels` row nor an `unsubscribed_channels` row.
@@ -888,7 +1009,7 @@ def find_orphan_channels() -> list[dict]:
     for cid in sorted(candidate_ids):
         episodes = db.get_episodes(cid)
         name = episodes[0]["channel_name"] if episodes else cid
-        size = _dir_bytes(os.path.join(AUDIO_DIR, cid)) + _dir_bytes(os.path.join(THUMBNAIL_DIR, cid))
+        size = channel_bytes(cid)
         orphans.append({
             "channel_id": cid,
             "channel_name": name,

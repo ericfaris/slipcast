@@ -13,6 +13,7 @@ from app.safety import is_safe_media_name
     "A1.b2.c3",                # multiple dots are fine
     "_KIXX9XxpoE.mp3",         # video IDs can start with underscore
     "-abc123.jpg",             # ...or with a dash
+    "dQw4w9WgXcQ.opus",         # AUDIO_CODEC=opus output — no extension is hardcoded
 ])
 def test_accepts_safe_names(name):
     assert is_safe_media_name(name) is True
