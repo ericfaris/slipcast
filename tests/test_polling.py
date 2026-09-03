@@ -1,5 +1,6 @@
 """Tests for the episode cap (prune) and members-only skip behavior."""
 import os
+import time
 
 from app import database as db, downloader
 
@@ -77,6 +78,12 @@ def test_prune_deletes_thumbnails_and_sweeps_orphans(tmp_path, monkeypatch):
     open(os.path.join(thumb_dir, "channel.jpg"), "wb").close()
     open(os.path.join(audio_dir, "orphan.mp3.part"), "wb").close()
     open(os.path.join(thumb_dir, "ghost.jpg"), "wb").close()
+    # orphan.mp3.part looks like a yt-dlp temp file, so the sweep only removes
+    # it once it's old enough that it can't still be an in-flight download —
+    # back-date it past the grace window (see test below for the "recent, so
+    # kept" half of this behavior).
+    old = time.time() - downloader._RECENT_FILE_GRACE_SECONDS - 60
+    os.utime(os.path.join(audio_dir, "orphan.mp3.part"), (old, old))
 
     downloader._prune_channel(CID)
 
@@ -84,6 +91,30 @@ def test_prune_deletes_thumbnails_and_sweeps_orphans(tmp_path, monkeypatch):
     assert kept == {"v002", "v003"}  # two newest
     assert sorted(os.listdir(audio_dir)) == ["v002.mp3", "v003.mp3"]
     assert sorted(os.listdir(thumb_dir)) == ["channel.jpg", "v002.jpg", "v003.jpg"]
+
+
+def test_sweep_skips_recent_temp_files_but_deletes_stale_ones(tmp_path, monkeypatch):
+    """A yt-dlp temp/in-progress file (e.g. another thread's in-flight download)
+    must survive a concurrent sweep if it's recent, but a genuinely abandoned
+    one (old) still gets cleaned up."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    audio_dir = downloader._audio_dir_for(CID)
+    thumb_dir = downloader._thumbnail_dir_for(CID)
+
+    recent_temp = os.path.join(audio_dir, "vAAAAAAAAAA.part")
+    stale_temp = os.path.join(audio_dir, "vBBBBBBBBBB.m4a")
+    open(recent_temp, "wb").close()
+    open(stale_temp, "wb").close()
+    old = time.time() - downloader._RECENT_FILE_GRACE_SECONDS - 60
+    os.utime(stale_temp, (old, old))
+    open(os.path.join(thumb_dir, "channel.jpg"), "wb").close()
+
+    downloader._sweep_orphan_files(CID)
+
+    remaining = os.listdir(audio_dir)
+    assert "vAAAAAAAAAA.part" in remaining  # recent — left alone
+    assert "vBBBBBBBBBB.m4a" not in remaining  # stale — swept
 
 
 def test_poll_does_not_redownload_pruned_video(tmp_path, monkeypatch):
@@ -371,3 +402,119 @@ def test_skip_video_roundtrip(tmp_path, monkeypatch):
     assert db.get_skip_video_ids(CID) == {"vid1", "vid2"}
     db.delete_skip_videos_for_channel(CID)
     assert db.get_skip_video_ids(CID) == set()
+
+
+# --- orphan detection --------------------------------------------------------
+
+def test_find_orphan_channels_detects_db_only_orphan(tmp_path, monkeypatch):
+    """Episodes exist for a channel_id with no channels/unsubscribed row."""
+    _setup_tmp(tmp_path, monkeypatch)
+    db.upsert_episode(_ep(0, CID))
+    db.upsert_episode(_ep(1, CID))
+    orphans = downloader.find_orphan_channels()
+    assert len(orphans) == 1
+    assert orphans[0]["channel_id"] == CID
+    assert orphans[0]["channel_name"] == "C"
+    assert orphans[0]["episode_count"] == 2
+
+
+def test_find_orphan_channels_detects_disk_only_orphan(tmp_path, monkeypatch):
+    """A leftover directory with no DB rows at all is still reported."""
+    _setup_tmp(tmp_path, monkeypatch)
+    os.makedirs(os.path.join(downloader.AUDIO_DIR, CID), exist_ok=True)
+    with open(os.path.join(downloader.AUDIO_DIR, CID, "stray.mp3"), "wb") as f:
+        f.write(b"x" * 100)
+    orphans = downloader.find_orphan_channels()
+    assert len(orphans) == 1
+    assert orphans[0]["channel_id"] == CID
+    assert orphans[0]["episode_count"] == 0
+    assert orphans[0]["bytes"] == 100
+
+
+def test_find_orphan_channels_ignores_owned_channels(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    url = "https://www.youtube.com/@SomeChannel"
+    db.add_channel(url)
+    db.update_channel_meta(url, CID, "C")
+    db.upsert_episode(_ep(0, CID))
+    assert downloader.find_orphan_channels() == []
+
+
+def test_find_orphan_channels_ignores_unsubscribed_channels(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    db.upsert_unsubscribed_channel(CID, "C")
+    db.upsert_episode(_ep(0, CID))
+    assert downloader.find_orphan_channels() == []
+
+
+# --- per-channel poll lock ---------------------------------------------------
+
+def test_poll_channel_refuses_concurrent_poll_of_same_channel(tmp_path, monkeypatch):
+    """A second poll of the same channel while one is in flight must return
+    immediately with an 'already_polling' marker, not block or double-run."""
+    _setup_tmp(tmp_path, monkeypatch)
+    url = "https://www.youtube.com/@SomeChannel"
+    db.add_channel(url)
+
+    key = downloader._poll_lock_key(url)
+    lock = downloader._get_poll_lock(key)
+    lock.acquire()  # simulate an in-flight poll of this channel
+    try:
+        result = downloader.poll_channel(url)
+    finally:
+        lock.release()
+    assert result["already_polling"] is True
+
+
+def test_poll_channel_lock_key_normalizes_url_variants(tmp_path, monkeypatch):
+    base = "https://youtube.com/@Chan"
+    with_slash = "https://youtube.com/@Chan/"
+    with_query = "https://youtube.com/@Chan?si=abc123"
+    assert downloader._poll_lock_key(base) == downloader._poll_lock_key(with_slash)
+    assert downloader._poll_lock_key(base) == downloader._poll_lock_key(with_query)
+
+
+def test_poll_channel_releases_lock_after_completion(tmp_path, monkeypatch):
+    """A poll must not leave the channel permanently locked out for later polls."""
+    _setup_tmp(tmp_path, monkeypatch)
+    url = "https://www.youtube.com/@SomeChannel"
+    db.add_channel(url)
+    entries = [{"id": "v000", "availability": None}]
+    _stub_poll_io(monkeypatch, entries)
+
+    downloader.poll_channel(url)
+    result = downloader.poll_channel(url)  # must run normally, not report already_polling
+    assert not result.get("already_polling")
+
+
+# --- one-off downloads respect the episode cap -------------------------------
+
+def test_download_single_prunes_over_cap_channel(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 2)
+    for i in range(5):
+        db.upsert_episode(_ep(i))  # 5 episodes already on this unsubscribed channel
+
+    info = {"id": "vNEW00000001", "channel_id": CID, "channel": "C"}
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL",
+                        lambda *a, **k: _FakeYDL(info))
+    monkeypatch.setattr(downloader, "_download_entry",
+                        lambda entry, cid, cname: _ep(5, cid))
+
+    downloader.download_single("https://youtu.be/vNEW00000001", subscribe=False)
+
+    assert len(db.get_episodes(CID)) == 2  # capped, same as a polled channel
+
+
+class _FakeYDL:
+    def __init__(self, info):
+        self._info = info
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def extract_info(self, *a, **k):
+        return self._info

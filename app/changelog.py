@@ -8,6 +8,19 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.11.0",
+        "date": "2026-09-03",
+        "changes": [
+            "Fixed a data-integrity bug where removing a channel could, in some cases (a URL variant, or a channel removed before its first successful poll), leave its downloaded episodes and audio/thumbnail files behind forever with no channel row pointing at them — invisible in the dashboard but still served at a live feed URL. Slipcast now checks for this kind of orphaned data on every startup (logged, never auto-deleted) and lists anything found in a new 'Orphaned data' section on the dashboard, with a one-click Delete.",
+            "One-off (unsubscribed) video downloads can now be removed from the dashboard — previously the only option was to subscribe to them, so they could never be deleted and their audio could grow without limit. They're also now capped at the same MAX_EPISODES_PER_CHANNEL as subscribed channels.",
+            "Fixed a bug where polling the same channel from two places at once (the scheduled poll and a manual 'poll now', or two overlapping 'poll all' runs) could delete each other's in-progress downloads. Each channel now polls exclusively — a second concurrent attempt is skipped with a clear 'already polling' message instead of corrupting the first one's work.",
+            "'Poll all' and 'poll selected' now run through a bounded worker pool (new POLL_CONCURRENCY env var, default 2) instead of spawning one unbounded thread per channel.",
+            "The database now uses WAL mode and a busy-timeout, so concurrent poll writes no longer risk a 'database is locked' error.",
+            "/health now reports real status (HTTP 503 + a breakdown of what's wrong) when the scheduler has stopped, polling has gone stale, or cookies are missing/expired — previously it always reported healthy, including throughout the multi-week silent-polling outage fixed in 1.10.0. Wired up to a Docker HEALTHCHECK.",
+            "Dashboard load is faster on installs with many episodes: episode counts are now computed with a single grouped query instead of loading every episode row per channel.",
+        ],
+    },
+    {
         "version": "1.10.0",
         "date": "2026-09-01",
         "changes": [

@@ -7,6 +7,7 @@ import secrets
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -22,8 +23,14 @@ from app import database as db
 from app import jobs
 from app import notify
 from app.safety import is_safe_media_name
-from app.config import AUDIO_DIR, ALERT_EMAIL, AUTH_CREDENTIALS, BASE_URL, COOKIES_FILE, POLL_INTERVAL_HOURS, THUMBNAIL_DIR
-from app.downloader import cookies_status, download_single, poll_all, poll_channel, remove_channel_data, valid_cookie_file
+from app.config import (
+    AUDIO_DIR, ALERT_EMAIL, AUTH_CREDENTIALS, BASE_URL, COOKIES_FILE,
+    POLL_CONCURRENCY, POLL_INTERVAL_HOURS, THUMBNAIL_DIR,
+)
+from app.downloader import (
+    cookies_status, download_single, find_orphan_channels, poll_all,
+    poll_channel, remove_channel_data, valid_cookie_file,
+)
 from app.feed import build_feed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -49,10 +56,19 @@ def _get_version() -> str:
 VERSION = _get_version()
 
 # When this process started — for a locally rebuilt/restarted container this is
-# effectively "deployed at". Shown in the About dialog as "running since".
+# effectively "deployed at". Shown in the About dialog as "running since", and
+# used by /health as a grace period before "no poll has ever run" counts as
+# degraded (a freshly started container hasn't had a chance to poll yet).
+_STARTED_MONOTONIC = time.monotonic()
 STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 _scheduler: BackgroundScheduler | None = None
+
+# Bounds how many channels poll concurrently from "poll all"/"poll selected" —
+# previously one unbounded thread per channel, which could also fire dozens of
+# concurrent yt-dlp processes. submit() returns immediately, so the endpoints
+# that use this still respond right away.
+_poll_executor = ThreadPoolExecutor(max_workers=POLL_CONCURRENCY, thread_name_prefix="poll")
 
 # Paths that podcast apps access — no auth required
 _PUBLIC_PREFIXES = ("/feed/", "/audio/", "/thumbnails/", "/static/", "/health", "/favicon.ico")
@@ -87,9 +103,29 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("No channels configured — add one at %s", BASE_URL)
 
+    # Report-only: log any channel data (episodes/files) with no owning row,
+    # so it's at least visible in the logs even before anyone opens the
+    # dashboard. Never auto-delete at startup — this is the user's data; the
+    # dashboard's orphan section and /channels/remove-orphan are how it's
+    # actually cleaned up, on purpose, by a person.
+    try:
+        orphans = find_orphan_channels()
+        for o in orphans:
+            logger.warning(
+                "Orphaned channel data: %s (%s) — %d episode(s), %.1f MB on disk, "
+                "no channels/unsubscribed_channels row owns it. Remove it from the "
+                "dashboard's orphaned-data section if you don't want it kept.",
+                o["channel_id"], o["channel_name"], o["episode_count"], o["bytes"] / 1_048_576,
+            )
+        if orphans:
+            logger.warning("Found %d orphaned channel(s) at startup", len(orphans))
+    except Exception:  # noqa: BLE001 — reconciliation must never block startup
+        logger.exception("Orphan reconciliation failed")
+
     yield
 
     _scheduler.shutdown()
+    _poll_executor.shutdown(wait=False)
 
 
 app = FastAPI(title="Slipcast", lifespan=lifespan)
@@ -340,7 +376,9 @@ def _episode_count(channel_id: str | None) -> int:
 
 
 def _total_episodes() -> int:
-    return sum(len(db.get_episodes(cid)) for cid in db.get_all_channel_ids())
+    # A single GROUP BY instead of loading every episode row per channel
+    # (twice, before/after) on every download job.
+    return sum(db.episode_counts().values())
 
 
 def _is_valid_channel_url(url: str) -> bool:
@@ -369,7 +407,10 @@ def _run_poll(url: str, label: str | None = None):
     before = _episode_count(pre_cid)
     jid = jobs.start("poll", label)
     try:
-        poll_channel(url)
+        summary = poll_channel(url)
+        if summary and summary.get("already_polling"):
+            jobs.finish(jid, "success", f"{label}: already polling — skipped")
+            return
         post_name, post_cid = lookup()
         label = post_name or label
         added = _episode_count(post_cid) - before
@@ -528,6 +569,14 @@ _PAGE = """<!DOCTYPE html>
             <div id="oneoff-grid" class="grid"></div>
         </section>
 
+        <section class="section" aria-labelledby="orphans-h" id="orphans-section" hidden>
+            <div class="section-head">
+                <h2 id="orphans-h">Orphaned data <span id="orphans-count" class="count-pill"></span></h2>
+            </div>
+            <p class="share-name">Episodes and files left behind by a removed channel — safe to delete if you don't recognize them.</p>
+            <div id="orphans-grid" class="grid"></div>
+        </section>
+
         <section class="section" aria-labelledby="cookies-h">
             <div class="section-head"><h2 id="cookies-h">YouTube cookies</h2></div>
             <div class="card cookies-card">
@@ -620,6 +669,7 @@ def index():
 @app.get("/api/state")
 def api_state():
     last_runs = db.get_last_poll_run_per_channel()
+    counts = db.episode_counts()
 
     def _last_poll(cid):
         r = last_runs.get(cid) if cid else None
@@ -639,7 +689,7 @@ def api_state():
             "url": ch["url"],
             "channel_id": cid,
             "name": ch["channel_name"] or ch["url"],
-            "episodes": _episode_count(cid),
+            "episodes": counts.get(cid, 0) if cid else 0,
             "feed_url": _feed_url(cid) if cid else None,
             "thumbnail": _thumb_url(cid) if cid else None,
             "added_at": ch["added_at"],
@@ -652,14 +702,21 @@ def api_state():
         unsubscribed.append({
             "channel_id": cid,
             "name": ch["channel_name"] or cid,
-            "episodes": _episode_count(cid),
+            "episodes": counts.get(cid, 0),
             "feed_url": _feed_url(cid),
             "thumbnail": _thumb_url(cid),
         })
 
+    orphans = []
+    try:
+        orphans = find_orphan_channels()
+    except Exception:  # noqa: BLE001 — orphan listing must never break the dashboard
+        logger.exception("Failed to list orphaned channels")
+
     return JSONResponse({
         "channels": channels,
         "unsubscribed": unsubscribed,
+        "orphans": orphans,
         "cookies": cookies_status(),
         "email": {"configured": notify._smtp_configured(), "address": ALERT_EMAIL},
         "next_poll": _next_poll_label(),
@@ -759,10 +816,39 @@ def subscribe_channel(channel_id: str = Form(...), channel_name: str = Form(...)
     return _ok(f"Subscribed to {channel_name}")
 
 
+def _normalize_channel_url(url: str) -> str:
+    """Loose comparison key for matching channel URLs across variants (case,
+    trailing slash, tracking query string) that all denote the same channel."""
+    p = urlparse(url.rstrip("/"))
+    return f"{p.netloc.lower()}{p.path.rstrip('/').lower()}"
+
+
+def _resolve_channel_id_for_removal(rurl: str) -> str | None:
+    """Best-effort channel_id lookup for a channels row about to be deleted.
+
+    An exact URL match (the old behavior) misses variants — different case,
+    a trailing slash, a tracking query string — and channels removed before
+    update_channel_meta ever populated channel_id. Without a resolved id, the
+    row disappears from the `channels` table but its episodes, skip_videos,
+    and on-disk audio/thumbnails are never cleaned up and become invisible
+    orphans (see find_orphan_channels / the startup reconciler), which is
+    exactly what happened in production. A normalized comparison across all
+    channel rows catches the variant case; if that still fails, the orphan
+    reconciler is the safety net that eventually surfaces what's left behind.
+    """
+    channel_id = db.get_channel_id_for_url(rurl)
+    if channel_id:
+        return channel_id
+    norm = _normalize_channel_url(rurl)
+    for ch in db.get_channels():
+        if ch["channel_id"] and _normalize_channel_url(ch["url"]) == norm:
+            return ch["channel_id"]
+    return None
+
+
 def _remove_one(url: str):
     rurl = url.rstrip("/")
-    channels = db.get_channels()
-    channel_id = next((ch["channel_id"] for ch in channels if ch["url"] == rurl), None)
+    channel_id = _resolve_channel_id_for_removal(rurl)
     db.remove_channel(rurl)
     if channel_id:
         db.delete_episodes_for_channel(channel_id)
@@ -774,6 +860,35 @@ def _remove_one(url: str):
 def remove_channel(url: str = Form(...)):
     _remove_one(url)
     return _ok("Channel removed")
+
+
+@app.post("/channels/remove-unsubscribed")
+def remove_unsubscribed_channel_endpoint(channel_id: str = Form(...)):
+    """Remove a one-off (unsubscribed) channel's row, episodes, and files.
+
+    Previously the only way to get rid of an unsubscribed channel was to
+    Subscribe to it — there was no way to delete it, so its audio grew
+    unbounded (see also: the _prune_channel call added to download_single).
+    """
+    if not _CHANNEL_ID_RE.match(channel_id):
+        raise HTTPException(status_code=400, detail="Invalid channel ID")
+    db.remove_unsubscribed_channel(channel_id)
+    db.delete_episodes_for_channel(channel_id)
+    db.delete_skip_videos_for_channel(channel_id)
+    remove_channel_data(channel_id)
+    return _ok("Channel removed")
+
+
+@app.post("/channels/remove-orphan")
+def remove_orphan_channel(channel_id: str = Form(...)):
+    """Delete episodes/skip_videos/files for a channel_id that find_orphan_channels
+    reported as owned by no `channels`/`unsubscribed_channels` row."""
+    if not _CHANNEL_ID_RE.match(channel_id):
+        raise HTTPException(status_code=400, detail="Invalid channel ID")
+    db.delete_episodes_for_channel(channel_id)
+    db.delete_skip_videos_for_channel(channel_id)
+    remove_channel_data(channel_id)
+    return _ok("Orphaned data removed")
 
 
 @app.post("/channels/remove-bulk")
@@ -795,8 +910,11 @@ def poll_now(url: str = Form(...)):
 async def poll_channels_bulk(request: Request):
     data = await request.json()
     urls = [u for u in data.get("urls", []) if isinstance(u, str)]
+    # Bounded worker pool instead of a thread per channel — submit() returns
+    # immediately (it only queues the work), so the endpoint still responds
+    # right away; poll_channel's own per-channel lock covers the rest.
     for u in urls:
-        threading.Thread(target=_run_poll, args=[u], daemon=True).start()
+        _poll_executor.submit(_run_poll, u)
     return _ok(f"Polling {len(urls)} channel(s)")
 
 
@@ -804,7 +922,7 @@ async def poll_channels_bulk(request: Request):
 def poll_all_now():
     channels = db.get_channels()
     for ch in channels:
-        threading.Thread(target=_run_poll, args=[ch["url"]], daemon=True).start()
+        _poll_executor.submit(_run_poll, ch["url"])
     return _ok(f"Polling {len(channels)} channel(s)")
 
 
@@ -856,6 +974,82 @@ def get_feed(channel_id: str):
     return Response(content=rss, media_type="application/rss+xml")
 
 
+def _seconds_since_last_poll() -> float | None:
+    """Seconds since the most recent poll_runs row finished (or started, if it
+    never finished), or None if no run has ever been recorded."""
+    runs = db.get_recent_poll_runs(1)
+    if not runs:
+        return None
+    ts = runs[0]["finished_at"] or runs[0]["started_at"]
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds()
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": VERSION}
+    """Report actual health, not just "the process is up".
+
+    The old unconditional {"status": "ok"} would have reported healthy
+    throughout the v1.10.0 multi-week silent-polling outage this project
+    already suffered — a hung scheduler with no error and no log output.
+    Returns 503 + "degraded" (with a "checks"/"problems" breakdown, nothing
+    sensitive) when the scheduler isn't running, polling has gone stale, or
+    the cookies file is missing/expired.
+    """
+    problems: list[str] = []
+    checks: dict[str, str] = {}
+
+    scheduler_running = _scheduler is not None and _scheduler.running
+    checks["scheduler"] = "running" if scheduler_running else "not running"
+    if not scheduler_running:
+        problems.append("scheduler is not running")
+
+    channels = db.get_channels()
+    # A poll finishing later than ~3x its own interval means it's stuck, not
+    # just running a bit long (matches the coalesce/misfire tolerance the
+    # scheduler itself is configured with — see lifespan).
+    stale_after = POLL_INTERVAL_HOURS * 3 * 3600
+    uptime = time.monotonic() - _STARTED_MONOTONIC
+    last_poll_age = _seconds_since_last_poll()
+    if not channels:
+        checks["polling"] = "no channels configured"
+    elif last_poll_age is None:
+        # Never recorded a run — only a problem once the process has been up
+        # long enough that the initial poll should have finished. A container
+        # that just started must not report degraded before it's had a chance.
+        if uptime > stale_after:
+            checks["polling"] = "no poll has ever completed"
+            problems.append("no poll has completed since startup")
+        else:
+            checks["polling"] = "starting up"
+    elif last_poll_age > stale_after:
+        checks["polling"] = f"stale — last run {int(last_poll_age // 3600)}h ago"
+        problems.append("polling appears stalled")
+    else:
+        checks["polling"] = "ok"
+
+    cstatus = cookies_status()
+    if not cstatus.get("present"):
+        checks["cookies"] = "missing or invalid"
+        problems.append("cookies file is missing or invalid")
+    elif cstatus.get("expired"):
+        checks["cookies"] = "expired"
+        problems.append("cookies file has expired")
+    else:
+        checks["cookies"] = "ok"
+
+    ok = not problems
+    body = {
+        "status": "ok" if ok else "degraded",
+        "version": VERSION,
+        "checks": checks,
+        "problems": problems,
+    }
+    return JSONResponse(body, status_code=200 if ok else 503)

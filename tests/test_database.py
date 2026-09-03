@@ -105,6 +105,35 @@ def test_last_poll_run_per_channel(tmp_path, monkeypatch):
     assert last[CID2]["downloaded"] == 3
 
 
+def test_episode_counts_groups_by_channel(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    db.upsert_episode(_ep(0, CID))
+    db.upsert_episode(_ep(1, CID))
+    db.upsert_episode(_ep(9, CID2))
+    assert db.episode_counts() == {CID: 2, CID2: 1}
+
+
+def test_episode_counts_empty_when_no_episodes(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    assert db.episode_counts() == {}
+
+
+def test_orphan_channel_ids_excludes_known_channels(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    db.upsert_episode(_ep(0, CID))       # orphan: no channels/unsubscribed row
+    db.upsert_episode(_ep(1, CID2))
+    db.add_channel("https://www.youtube.com/@A")
+    db.update_channel_meta("https://www.youtube.com/@A", CID, "A")  # CID now owned
+    db.upsert_unsubscribed_channel(CID2, "B")  # CID2 now owned
+    assert db.orphan_channel_ids() == set()
+
+
+def test_orphan_channel_ids_finds_truly_orphaned(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    db.upsert_episode(_ep(0, CID))
+    assert db.orphan_channel_ids() == {CID}
+
+
 def test_upsert_episode_is_idempotent_on_id(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
     db.upsert_episode(_ep(0))

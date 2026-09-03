@@ -24,6 +24,10 @@ else:
 MAX_EPISODES_PER_CHANNEL = int(os.environ.get("MAX_EPISODES_PER_CHANNEL", "20"))
 POLL_INTERVAL_HOURS = int(os.environ.get("POLL_INTERVAL_HOURS", "6"))
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "/data/cookies.txt")
+# Max channels polled at once by "poll all"/"poll selected". A thread per
+# channel with no cap made it trivial to fire dozens of concurrent yt-dlp
+# processes; bound it with a worker pool instead.
+POLL_CONCURRENCY = int(os.environ.get("POLL_CONCURRENCY", "2"))
 
 # --- Email alerts (cookie expiry / invalid cookies) ---------------------------
 # Configure SMTP to receive an email when the cookies file needs to be re-uploaded.

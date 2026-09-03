@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -49,7 +50,11 @@ _AUTH_ERROR_SIGNALS = (
     "confirm you're not a bot",
     "this video is available to this channel's members",
     "use --cookies",
-    "cookies",
+    # Not the bare word "cookies" — that matched any error merely *mentioning*
+    # cookies (e.g. a message suggesting a workaround) and fired a cookie-
+    # expiry email on unrelated failures. This phrase is yt-dlp's actual
+    # diagnostic wording for a rejected/expired cookie file.
+    "cookies are no longer valid",
     "login required",
     "account cookies",
     "consent",
@@ -285,7 +290,7 @@ def _ydl_opts(channel_id: str) -> dict:
     }
 
 
-def _fetch_channel_entries(channel_url: str, max_entries: int) -> list[dict]:
+def _fetch_channel_entries(channel_url: str, max_entries: int) -> tuple[list[dict], str, str]:
     """Return metadata for the most recent max_entries videos without downloading."""
     opts = {
         **_base_ydl_opts(),
@@ -402,12 +407,43 @@ def _prune_channel(channel_id: str):
     _sweep_orphan_files(channel_id)
 
 
+# yt-dlp writes intermediate files into the *same* audio directory as the
+# final .mp3 while a download is in progress (the pre-conversion audio format,
+# plus its own ".part"/".ytdl" progress-tracking files); _download_thumbnail
+# similarly writes "<dest>.tmp" before the ffmpeg conversion lands. None of
+# these are ever referenced by an episode row, so a sweep running in one
+# thread while another thread is mid-download would previously delete them
+# out from under it. We can't tell a file that's genuinely orphaned (left by
+# an interrupted, abandoned download) from one that's simply mid-flight by
+# name alone — but a real download/conversion finishes in well under an hour,
+# so recency is a reliable enough signal: skip temp-shaped files touched
+# recently, delete ones old enough that they can't still be in progress.
+_YTDLP_TEMP_SUFFIXES = (".part", ".ytdl", ".temp", ".tmp")
+_YTDLP_PRECONVERT_SUFFIXES = (".m4a", ".webm", ".opus", ".aac", ".ogg", ".mp4", ".mkv")
+_RECENT_FILE_GRACE_SECONDS = 3600
+
+
+def _looks_like_ytdlp_temp(name: str) -> bool:
+    lower = name.lower()
+    return lower.endswith(_YTDLP_TEMP_SUFFIXES) or lower.endswith(_YTDLP_PRECONVERT_SUFFIXES)
+
+
+def _is_recent(path: str) -> bool:
+    try:
+        return (time.time() - os.path.getmtime(path)) < _RECENT_FILE_GRACE_SECONDS
+    except OSError:
+        return False
+
+
 def _sweep_orphan_files(channel_id: str) -> None:
     """Delete any audio/thumbnail file not referenced by the channel's episodes.
 
     Runs against whatever the DB currently holds (already capped to
     MAX_EPISODES_PER_CHANNEL), so it reflects exactly the kept episodes. The
-    channel's cover art (`channel.jpg`) is always preserved.
+    channel's cover art (`channel.jpg`) is always preserved. Files that look
+    like an in-progress yt-dlp download or thumbnail conversion are left alone
+    unless they're stale (see _RECENT_FILE_GRACE_SECONDS) — see module-level
+    comment above.
     """
     episodes = db.get_episodes(channel_id)
     keep_audio = {ep["filename"] for ep in episodes if ep["filename"]}
@@ -416,16 +452,68 @@ def _sweep_orphan_files(channel_id: str) -> None:
 
     audio_dir = _audio_dir_for(channel_id)
     for name in os.listdir(audio_dir):
-        if name not in keep_audio:
-            _remove_if_exists(os.path.join(audio_dir, name))
+        if name in keep_audio:
+            continue
+        path = os.path.join(audio_dir, name)
+        if _looks_like_ytdlp_temp(name) and _is_recent(path):
+            continue
+        _remove_if_exists(path)
 
     thumb_dir = _thumbnail_dir_for(channel_id)
     for name in os.listdir(thumb_dir):
-        if name not in keep_thumbs:
-            _remove_if_exists(os.path.join(thumb_dir, name))
+        if name in keep_thumbs:
+            continue
+        path = os.path.join(thumb_dir, name)
+        if _looks_like_ytdlp_temp(name) and _is_recent(path):
+            continue
+        _remove_if_exists(path)
+
+
+# Per-channel locks so two concurrent pollers (the scheduled poll_all, a
+# manual "poll now", "poll selected", and "poll all" from the UI) can never
+# run poll_channel for the *same* channel at once. Without this, two
+# concurrent runs each prune/sweep against their own snapshot of "current
+# episodes" while the other is mid-download, deleting each other's in-flight
+# files (see _sweep_orphan_files). Keyed on the normalized URL so "add trailing
+# slash"/"share-link query string" variants of the same channel still collide.
+_poll_locks: dict[str, threading.Lock] = {}
+_poll_locks_guard = threading.Lock()
+
+
+def _poll_lock_key(url: str) -> str:
+    parsed = urlparse(url.rstrip("/"))
+    return parsed._replace(query="", fragment="").geturl().rstrip("/").lower()
+
+
+def _get_poll_lock(key: str) -> threading.Lock:
+    with _poll_locks_guard:
+        lock = _poll_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _poll_locks[key] = lock
+        return lock
 
 
 def poll_channel(channel_url: str):
+    """Poll one channel, refusing to run concurrently with itself.
+
+    Returns a summary dict on completion, or {"already_polling": True, ...} if
+    another poll of the same channel is already in flight — the caller (see
+    main._run_poll) surfaces that through the jobs tracker as a toast instead
+    of silently blocking or double-running.
+    """
+    lock = _get_poll_lock(_poll_lock_key(channel_url))
+    if not lock.acquire(blocking=False):
+        logger.info("Skipping poll for %s — already in progress", channel_url)
+        return {"channel_name": None, "downloaded": 0, "failures": [],
+                "error": None, "already_polling": True}
+    try:
+        return _poll_channel_locked(channel_url)
+    finally:
+        lock.release()
+
+
+def _poll_channel_locked(channel_url: str):
     original_url = channel_url.rstrip("/")
     # Strip query/fragment (e.g. share-link `?si=...` tracking params) before
     # appending "/videos" — otherwise it lands inside the query string and
@@ -625,6 +713,12 @@ def download_single(video_url: str, subscribe: bool = False):
     if result:
         db.upsert_episode(result)
         logger.info("Downloaded single video: %s", result["title"])
+        # One-off/unsubscribed channels are never polled, so poll_channel's cap
+        # enforcement never runs for them — without this, repeatedly
+        # downloading individual videos from the same channel grows its audio
+        # without limit. Subscribed channels get this for free via poll_channel,
+        # but it's harmless (a no-op below the cap) to call it again here too.
+        _prune_channel(channel_id)
 
 
 def remove_channel_data(channel_id: str):
@@ -639,3 +733,50 @@ def remove_channel_data(channel_id: str):
         if os.path.exists(path):
             shutil.rmtree(path)
             logger.info("Removed directory: %s", path)
+
+
+def _dir_bytes(path: str) -> int:
+    total = 0
+    if os.path.isdir(path):
+        for name in os.listdir(path):
+            fp = os.path.join(path, name)
+            if os.path.isfile(fp):
+                total += os.path.getsize(fp)
+    return total
+
+
+def find_orphan_channels() -> list[dict]:
+    """Find channel data (episodes rows and/or on-disk directories) owned by
+    neither a `channels` row nor an `unsubscribed_channels` row.
+
+    Two ways this happens: `_remove_one` (app/main.py) fails to resolve a
+    channel_id before deleting the `channels` row (a URL variant, or a channel
+    removed before update_channel_meta ever ran) and leaves its episodes,
+    skip_videos, and files behind; or those files/rows survive a delete that
+    was interrupted partway through. This only detects — nothing here deletes
+    anything; callers decide (see app.main lifespan report and the
+    /channels/remove-orphan endpoint).
+    """
+    known = {ch["channel_id"] for ch in db.get_channels() if ch["channel_id"]}
+    known |= {ch["channel_id"] for ch in db.get_unsubscribed_channels()}
+
+    candidate_ids = set(db.orphan_channel_ids())
+    for base in (AUDIO_DIR, THUMBNAIL_DIR):
+        if os.path.isdir(base):
+            for name in os.listdir(base):
+                if _CHANNEL_ID_RE.match(name) and name not in known:
+                    candidate_ids.add(name)
+    candidate_ids -= known
+
+    orphans = []
+    for cid in sorted(candidate_ids):
+        episodes = db.get_episodes(cid)
+        name = episodes[0]["channel_name"] if episodes else cid
+        size = _dir_bytes(os.path.join(AUDIO_DIR, cid)) + _dir_bytes(os.path.join(THUMBNAIL_DIR, cid))
+        orphans.append({
+            "channel_id": cid,
+            "channel_name": name,
+            "episode_count": len(episodes),
+            "bytes": size,
+        })
+    return orphans
