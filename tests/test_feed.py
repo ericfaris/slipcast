@@ -190,12 +190,13 @@ def test_combined_feed_respects_cap(tmp_path, monkeypatch):
 
 
 def test_combined_feed_does_not_duplicate_shared_channel_id(tmp_path, monkeypatch):
-    """Two channels rows can point at one channel_id (URL variants) — a JOIN
-    would emit each episode twice. The query uses a subquery for this reason."""
+    """A second URL variant for an already-subscribed channel collapses into the
+    existing row (1.15: channel_id is the PK), so its episodes appear once."""
     _setup_tmp(tmp_path, monkeypatch)
-    _subscribe(CID, "Chan A")
+    url = _subscribe(CID, "Chan A")
     db.add_channel("https://www.youtube.com/@ChanA")
     db.update_channel_meta("https://www.youtube.com/@ChanA", CID, "Chan A")
+    assert [r["url"] for r in db.get_channels()] == [url]
     db.upsert_episode(_ep(1))
     assert _titles(feed.build_combined_feed()) == ["Episode 1"]
 
