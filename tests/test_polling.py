@@ -1023,3 +1023,99 @@ def test_download_single_ignores_duration_cap(tmp_path, monkeypatch):
 
     assert calls == [{"enforce_duration": False}]
     assert len(db.get_episodes(CID)) == 1
+
+
+# --- explicit episode re-download -------------------------------------------
+
+VID = "vAAAAAAAAAA"  # 11 chars — a valid video_id per the regex
+
+
+def test_redownload_replaces_existing_file(tmp_path, monkeypatch):
+    """AC5: the "already on disk" short-circuit must be bypassed.
+
+    _download_entry returns None when the file already exists, so a re-download
+    only works if the old file is gone by the time it's called — that's what the
+    stub asserts.
+    """
+    _setup_tmp(tmp_path, monkeypatch)
+    audio_dir = downloader._audio_dir_for(CID)
+    path = os.path.join(audio_dir, f"{VID}.mp3")
+    with open(path, "wb") as f:
+        f.write(b"corrupt")
+
+    seen = {}
+
+    def _fake_download(entry, channel_id, channel_name, **kwargs):
+        seen["existed"] = os.path.exists(path)  # must already be gone
+        with open(path, "wb") as f:
+            f.write(b"fresh")
+        return {**_ep(1), "id": entry["id"], "filename": f"{VID}.mp3", "filesize": 5}
+
+    monkeypatch.setattr(downloader, "_download_entry", _fake_download)
+    result = downloader.redownload_episode(VID, CID, "C")
+
+    assert seen["existed"] is False
+    assert result["id"] == VID
+    assert open(path, "rb").read() == b"fresh"
+
+
+def test_redownload_removes_other_codec_file_too(tmp_path, monkeypatch):
+    """An episode downloaded under a different AUDIO_CODEC still occupies the
+    "already have it" slot — leaving it behind would make the next poll think
+    the video is present under the old extension."""
+    _setup_tmp(tmp_path, monkeypatch)
+    audio_dir = downloader._audio_dir_for(CID)
+    stale = os.path.join(audio_dir, f"{VID}.opus")
+    with open(stale, "wb") as f:
+        f.write(b"old")
+    monkeypatch.setattr(downloader, "_download_entry", lambda *a, **k: None)
+    assert downloader.redownload_episode(VID, CID, "C") is None
+    assert not os.path.exists(stale)
+
+
+def test_redownload_rejects_bad_ids(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    called = []
+    monkeypatch.setattr(downloader, "_download_entry",
+                        lambda *a, **k: called.append(a))
+    assert downloader.redownload_episode("../etc/passwd", CID, "C") is None
+    assert downloader.redownload_episode(VID, "../etc", "C") is None
+    assert called == []
+
+
+def test_redownload_returns_none_for_members_only(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+
+    def _raise(*a, **k):
+        raise downloader.MemberOnlyError(VID)
+
+    monkeypatch.setattr(downloader, "_download_entry", _raise)
+    assert downloader.redownload_episode(VID, CID, "C") is None
+
+
+def test_delete_episode_files_removes_audio_and_thumbnail(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    audio = os.path.join(downloader._audio_dir_for(CID), "v001.mp3")
+    thumb = os.path.join(downloader._thumbnail_dir_for(CID), "v001.jpg")
+    for p in (audio, thumb):
+        with open(p, "wb") as f:
+            f.write(b"x")
+    downloader.delete_episode_files(CID, "v001.mp3", "v001.jpg")
+    assert not os.path.exists(audio)
+    assert not os.path.exists(thumb)
+
+
+def test_delete_episode_files_refuses_unsafe_names(tmp_path, monkeypatch):
+    """Defense in depth: a hand-edited row must not turn a delete into a
+    traversal that reaches outside the channel's own directory."""
+    _setup_tmp(tmp_path, monkeypatch)
+    outside = tmp_path / "precious.txt"
+    outside.write_text("keep me")
+    downloader.delete_episode_files(CID, "../../precious.txt", None)
+    downloader.delete_episode_files("../etc", "v001.mp3", None)
+    assert outside.exists()
+
+
+def test_delete_episode_files_tolerates_missing_files(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    downloader.delete_episode_files(CID, "gone.mp3", "gone.jpg")  # must not raise

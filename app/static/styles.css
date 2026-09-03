@@ -368,6 +368,13 @@ input[type=text], input[type=search], input[type=file], select {
 .ep-row-meta { font-size: .76rem; color: var(--muted); margin-top: 3px; }
 .ep-play { flex: none; }
 .ep-play audio { height: 34px; max-width: 210px; vertical-align: middle; }
+.ep-actions { flex: none; display: flex; gap: 6px; }
+/* With Play + Re-download + Delete the row no longer fits on a phone. */
+@media (max-width: 560px) { .ep-row { flex-wrap: wrap; } .ep-body { flex-basis: 100%; } }
+/* Feed settings modal */
+.fs-form { display: flex; flex-direction: column; gap: 12px; text-align: left; }
+.fs-field { display: flex; flex-direction: column; gap: 5px; font-size: .8rem; color: var(--muted); }
+.fs-field select, .fs-field input { font-size: .9rem; }
 .ep-empty { padding: 28px 10px; text-align: center; color: var(--muted); }
 .ep-badge.link { cursor: pointer; transition: border-color .15s, color .15s, background .15s; }
 .ep-badge.link:hover { color: var(--primary); border-color: var(--primary); background: var(--primary-soft); }

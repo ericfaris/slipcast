@@ -3,6 +3,7 @@
 These call the route handlers directly so we don't boot the scheduler/app.
 """
 import asyncio
+import html
 import io
 import os
 import time
@@ -13,7 +14,7 @@ from starlette.datastructures import Headers
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.requests import Request
 
-from app import __version__, config, database as db, downloader, main, notify
+from app import __version__, config, database as db, downloader, feed, main, notify
 
 
 def _req(method="GET", path="/", headers=None, client=("8.8.8.8", 1234)):
@@ -623,3 +624,270 @@ def test_health_live_ok_when_polling_recent(monkeypatch):
 def test_health_live_is_public():
     """The Docker HEALTHCHECK and ops/autoheal.sh curl it without credentials."""
     assert "/health/live".startswith(main._PUBLIC_PREFIXES)
+
+
+# ---------------------------------------------------------------------------
+# Feed access tokens, combined feed, episode delete/re-download, feed settings
+# ---------------------------------------------------------------------------
+
+FCID = "UCfeed12345678901234567890"
+
+
+def _seed_channel_with_episode(tmp_path, monkeypatch, cid=FCID):
+    """A subscribed channel with one episode, on a throwaway DB + dirs."""
+    _setup_tmp_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(feed, "BASE_URL", "https://example.test")
+    monkeypatch.setattr(feed, "THUMBNAIL_DIR", str(tmp_path / "thumb"))
+    url = f"https://www.youtube.com/channel/{cid}"
+    db.add_channel(url)
+    db.update_channel_meta(url, cid, "Feed Chan")
+    db.upsert_episode({
+        "id": "vid00000001", "channel_id": cid, "channel_name": "Feed Chan",
+        "title": "Hello", "description": "", "published": "2026-06-20T00:00:00+00:00",
+        "duration": 60, "filename": "vid00000001.mp3", "filesize": 10, "thumbnail": None,
+    })
+    return url
+
+
+def test_feed_without_token_works_when_enforcement_off(tmp_path, monkeypatch):
+    """AC1: the default (enforcement off) must not break token-less URLs."""
+    _seed_channel_with_episode(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", False)
+    resp = main.get_feed(FCID)
+    assert resp.media_type == "application/rss+xml"
+    assert b"<item>" in resp.body
+
+
+def test_feed_requires_token_when_enforcement_on(tmp_path, monkeypatch):
+    """AC2: missing/wrong token 404s; the right one serves the feed."""
+    _seed_channel_with_episode(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", True)
+
+    with pytest.raises(HTTPException) as exc:
+        main.get_feed(FCID)
+    assert exc.value.status_code == 404
+    with pytest.raises(HTTPException) as exc:
+        main.get_feed(FCID, token="not-the-token")
+    assert exc.value.status_code == 404
+
+    token = db.get_or_create_feed_token(FCID)
+    assert token
+    resp = main.get_feed(FCID, token=token)
+    assert b"<item>" in resp.body
+
+
+def test_feed_token_404s_when_channel_has_no_row(tmp_path, monkeypatch):
+    """Fail closed: episodes with no owning channel row are not servable at all
+    once enforcement is on, rather than servable by anyone."""
+    _setup_tmp_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(feed, "BASE_URL", "https://example.test")
+    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", True)
+    orphan = "UCorphan123456789012345678"
+    db.upsert_episode({
+        "id": "vid00000002", "channel_id": orphan, "channel_name": "Orphan",
+        "title": "T", "description": "", "published": "2026-06-20T00:00:00+00:00",
+        "duration": 60, "filename": "vid00000002.mp3", "filesize": 10, "thumbnail": None,
+    })
+    assert db.get_feed_token(orphan) is None
+    with pytest.raises(HTTPException) as exc:
+        main.get_feed(orphan)
+    assert exc.value.status_code == 404
+
+
+def test_token_ok_is_inert_while_enforcement_off(monkeypatch):
+    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", False)
+    assert main._token_ok(None, None) is True
+    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", True)
+    # compare_digest would raise on a None; the guard must return False instead.
+    assert main._token_ok(None, "x") is False
+    assert main._token_ok("x", None) is False
+    assert main._token_ok("x", "x") is True
+
+
+def test_feed_url_includes_token(tmp_path, monkeypatch):
+    _seed_channel_with_episode(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "BASE_URL", "https://example.test")
+    url = main._feed_url(FCID)
+    token = db.get_feed_token(FCID)
+    assert url == f"https://example.test/feed/{FCID}.xml?token={token}"
+
+
+def test_api_state_carries_all_feed_url_but_never_a_raw_token(tmp_path, monkeypatch):
+    """The token may only appear inside a feed URL — never as its own field."""
+    import json
+    _seed_channel_with_episode(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "BASE_URL", "https://example.test")
+    data = json.loads(main.api_state().body)
+    assert data["all_feed_url"].startswith("https://example.test/feed/all.xml?token=")
+    ch = next(c for c in data["channels"] if c["channel_id"] == FCID)
+    assert "feed_token" not in ch
+    assert ch["feed_settings"] == {"category": None, "language": None, "explicit": None}
+
+
+def test_all_feed_route_is_not_swallowed_by_channel_route(tmp_path, monkeypatch):
+    """AC3: /feed/all.xml must be registered BEFORE /feed/{channel_id}.xml.
+
+    Starlette matches in registration order with no literal-over-parameter
+    preference, so the wrong order silently routes "all" to get_feed as a
+    channel_id and returns a plausible-looking "channel not found".
+    """
+    from starlette.testclient import TestClient
+    _setup_tmp_db(tmp_path, monkeypatch)   # empty DB, so the 404 below is the real one
+    paths = [getattr(r, "path", None) for r in main.app.router.routes]
+    assert paths.index("/feed/all.xml") < paths.index("/feed/{channel_id}.xml")
+
+    # And live through the real router. Not entering the `with` block keeps the
+    # app's lifespan (scheduler + initial poll) from starting.
+    client = TestClient(main.app)
+    resp = client.get("/feed/all.xml")
+    match = [r for r in main.app.router.routes
+             if getattr(r, "path", None) == "/feed/all.xml"][0]
+    assert match.endpoint is main.get_combined_feed
+    # Empty DB → the combined handler's own 404, not the channel one's.
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "No episodes yet"
+
+
+def test_all_feed_route_serves_combined_feed_through_router(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+    _seed_channel_with_episode(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", False)
+    client = TestClient(main.app)
+    resp = client.get("/feed/all.xml")
+    assert resp.status_code == 200
+    assert "Slipcast" in resp.text and "Hello" in resp.text
+
+
+def test_combined_feed_requires_token_when_enforcement_on(tmp_path, monkeypatch):
+    _seed_channel_with_episode(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", True)
+    with pytest.raises(HTTPException) as exc:
+        main.get_combined_feed()
+    assert exc.value.status_code == 404
+    resp = main.get_combined_feed(token=db.get_or_create_all_feed_token())
+    assert b"<item>" in resp.body
+
+
+def test_delete_episode_removes_row_and_files(tmp_path, monkeypatch):
+    """AC4: files + row gone, and deliberately NO skip_videos entry."""
+    _setup_tmp_db(tmp_path, monkeypatch)
+    audio = os.path.join(downloader._audio_dir_for(FCID), "vid00000001.mp3")
+    thumb = os.path.join(downloader._thumbnail_dir_for(FCID), "vid00000001.jpg")
+    for p in (audio, thumb):
+        with open(p, "wb") as f:
+            f.write(b"x")
+    db.upsert_episode({
+        "id": "vid00000001", "channel_id": FCID, "channel_name": "C", "title": "T",
+        "description": "", "published": "2026-06-20T00:00:00+00:00", "duration": 1,
+        "filename": "vid00000001.mp3", "filesize": 1, "thumbnail": "vid00000001.jpg",
+    })
+
+    resp = main.delete_episode_endpoint(episode_id="vid00000001")
+    assert resp.status_code == 200
+    assert not os.path.exists(audio)
+    assert not os.path.exists(thumb)
+    assert db.get_episode("vid00000001") is None
+    # An explicit delete must stay re-downloadable — unlike a prune.
+    assert db.get_skip_video_ids(FCID) == set()
+
+
+def test_delete_episode_404s_for_unknown_id(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        main.delete_episode_endpoint(episode_id="nope")
+    assert exc.value.status_code == 404
+
+
+def test_redownload_endpoint_404s_for_unknown_id(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        main.redownload_episode_endpoint(episode_id="nope")
+    assert exc.value.status_code == 404
+
+
+def test_redownload_endpoint_starts_job(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    db.upsert_episode({
+        "id": "vid00000001", "channel_id": FCID, "channel_name": "C", "title": "T",
+        "description": "", "published": "2026-06-20T00:00:00+00:00", "duration": 1,
+        "filename": "vid00000001.mp3", "filesize": 1, "thumbnail": None,
+    })
+    calls = []
+    monkeypatch.setattr(main, "redownload_episode",
+                        lambda *a: calls.append(a) or None)
+    resp = main.redownload_episode_endpoint(episode_id="vid00000001")
+    assert resp.status_code == 200
+    # The work runs on a daemon thread; give it a moment to land.
+    for _ in range(100):
+        if calls:
+            break
+        time.sleep(0.01)
+    assert calls == [("vid00000001", FCID, "C")]
+
+
+def test_run_redownload_upserts_the_returned_row(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    row = {
+        "id": "vid00000001", "channel_id": FCID, "channel_name": "C", "title": "Fresh",
+        "description": "", "published": "2026-06-21T00:00:00+00:00", "duration": 2,
+        "filename": "vid00000001.mp3", "filesize": 99, "thumbnail": None,
+    }
+    monkeypatch.setattr(main, "redownload_episode", lambda *a: row)
+    main._run_redownload("vid00000001", FCID, "C", "T")
+    assert db.get_episode("vid00000001")["title"] == "Fresh"
+
+
+def test_feed_settings_saves_and_clears(tmp_path, monkeypatch):
+    _seed_channel_with_episode(tmp_path, monkeypatch)
+    main.set_feed_settings(channel_id=FCID, category="Comedy", language="es",
+                           explicit="clean")
+    row = db.get_channel_feed_settings(FCID)
+    assert (row["itunes_category"], row["itunes_language"], row["itunes_explicit"]) \
+        == ("Comedy", "es", "clean")
+    # Blank means "use the default" — stores NULL so the value can be cleared.
+    main.set_feed_settings(channel_id=FCID, category="", language="", explicit="")
+    row = db.get_channel_feed_settings(FCID)
+    assert (row["itunes_category"], row["itunes_language"], row["itunes_explicit"]) \
+        == (None, None, None)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"category": "Underwater Basketweaving"},
+    {"explicit": "maybe"},
+    {"language": "not a language tag"},
+])
+def test_feed_settings_rejects_bad_values(tmp_path, monkeypatch, overrides):
+    _seed_channel_with_episode(tmp_path, monkeypatch)
+    kwargs = {"category": "", "language": "", "explicit": "", **overrides}
+    with pytest.raises(HTTPException) as exc:
+        main.set_feed_settings(channel_id=FCID, **kwargs)
+    assert exc.value.status_code == 400
+
+
+def test_feed_settings_404s_for_unknown_channel(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        main.set_feed_settings(channel_id="UCnope1234567890123456789",
+                               category="Comedy", language="", explicit="")
+    assert exc.value.status_code == 404
+
+
+def test_feed_settings_rejects_bad_channel_id(tmp_path, monkeypatch):
+    _setup_tmp_db(tmp_path, monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        main.set_feed_settings(channel_id="../etc/passwd", category="",
+                               language="", explicit="")
+    assert exc.value.status_code == 400
+
+
+def test_category_dropdown_matches_the_validated_list():
+    """The rendered <select> must not offer a value the endpoint would reject."""
+    for category in feed.ITUNES_CATEGORIES:
+        assert f'<option value="{html.escape(category)}">' in main._PAGE
+
+
+def test_new_mutating_endpoints_are_not_public():
+    """They're normal authenticated dashboard mutations — Basic Auth + CSRF."""
+    for path in ("/episodes/delete", "/episodes/redownload", "/channels/feed-settings"):
+        assert not path.startswith(main._PUBLIC_PREFIXES)
+        assert path not in main._MUTATING_GET_PATHS
