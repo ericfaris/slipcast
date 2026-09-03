@@ -102,3 +102,34 @@ def test_feed_survives_bad_published_date(tmp_path, monkeypatch):
     db.upsert_episode(ep)
     # Should not raise; falls back to "now".
     assert len(_items(feed.build_feed(CID))) == 1
+
+
+def test_feed_enclosure_type_matches_extension(tmp_path, monkeypatch):
+    """A channel can legitimately hold both old .mp3 and new .opus episodes
+    (AUDIO_CODEC changed mid-flight) — each item's enclosure MIME must match
+    its own stored file, not a single global setting."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(feed, "MAX_EPISODES_PER_CHANNEL", 20)
+    mp3_ep = _ep(1)
+    opus_ep = _ep(2)
+    opus_ep["filename"] = "v002.opus"
+    db.upsert_episode(mp3_ep)
+    db.upsert_episode(opus_ep)
+
+    items = _items(feed.build_feed(CID))
+    by_title = {it.find("title").text: it.find("enclosure") for it in items}
+    assert by_title["Episode 1"].get("type") == "audio/mpeg"
+    assert by_title["Episode 1"].get("url") == "https://example.test/audio/%s/v001.mp3" % CID
+    assert by_title["Episode 2"].get("type") == "audio/ogg"
+    assert by_title["Episode 2"].get("url") == "https://example.test/audio/%s/v002.opus" % CID
+
+
+def test_feed_unknown_extension_defaults_to_audio_mpeg(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(feed, "MAX_EPISODES_PER_CHANNEL", 20)
+    ep = _ep(1)
+    ep["filename"] = "v001.weird"
+    db.upsert_episode(ep)
+    items = _items(feed.build_feed(CID))
+    assert len(items) == 1  # still emitted — is_safe_media_name accepts it
+    assert items[0].find("enclosure").get("type") == "audio/mpeg"

@@ -126,6 +126,11 @@ function epBadge(ch) {
   });
 }
 
+function sizeBadge(ch) {
+  if (!ch.bytes) return null;
+  return el('span', { class: 'ep-badge', title: 'Audio + thumbnails on disk', text: fmtBytes(ch.bytes) });
+}
+
 function lastPollBadge(ch) {
   const lp = ch.last_poll;
   if (!lp) return null;
@@ -154,7 +159,7 @@ function subscribedCard(ch) {
     avatar(ch.name, ch.thumbnail),
     el('div', { class: 'ch-meta' }, [
       el('div', { class: 'ch-name', title: ch.name, text: ch.name }),
-      el('div', { class: 'ch-sub' }, [epBadge(ch), lastPollBadge(ch)]),
+      el('div', { class: 'ch-sub' }, [epBadge(ch), sizeBadge(ch), lastPollBadge(ch)]),
     ]),
   ]));
 
@@ -178,7 +183,7 @@ function oneoffCard(ch) {
       avatar(ch.name, ch.thumbnail),
       el('div', { class: 'ch-meta' }, [
         el('div', { class: 'ch-name', title: ch.name, text: ch.name }),
-        el('div', { class: 'ch-sub' }, [epBadge(ch)]),
+        el('div', { class: 'ch-sub' }, [epBadge(ch), sizeBadge(ch)]),
       ]),
     ]),
     el('div', { class: 'ch-actions' }, [
@@ -242,6 +247,7 @@ function render() {
 
   // counts + polling panel
   $('#subs-count').textContent = d.channels.length;
+  $('#subs-storage').textContent = d.total_bytes ? `${fmtBytes(d.total_bytes)} on disk` : '';
   $('#oneoff-count').textContent = d.unsubscribed.length;
   renderPolling(d);
 

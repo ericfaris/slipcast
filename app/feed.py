@@ -9,6 +9,19 @@ from app.safety import is_safe_media_name
 
 logger = logging.getLogger(__name__)
 
+# The enclosure type must describe the file we actually stored, not whatever
+# AUDIO_CODEC currently says — a feed can hold .mp3 episodes downloaded before
+# the setting changed alongside newer .opus ones. yt-dlp's opus output is an Ogg
+# container (RFC 7845), which is audio/ogg; audio/opus is an RTP payload type,
+# not a file type.
+_ENCLOSURE_TYPES = {".mp3": "audio/mpeg", ".opus": "audio/ogg", ".ogg": "audio/ogg",
+                    ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
+                    ".wav": "audio/wav"}
+
+
+def _enclosure_type(filename: str) -> str:
+    return _ENCLOSURE_TYPES.get(os.path.splitext(filename)[1].lower(), "audio/mpeg")
+
 
 def build_feed(channel_id: str) -> bytes:
     # Defense in depth: cap the feed itself rather than trusting that pruning
@@ -68,7 +81,7 @@ def build_feed(channel_id: str) -> bytes:
         fe.published(pub)
 
         audio_url = f"{BASE_URL}/audio/{channel_id}/{ep['filename']}"
-        fe.enclosure(audio_url, str(ep["filesize"] or 0), "audio/mpeg")
+        fe.enclosure(audio_url, str(ep["filesize"] or 0), _enclosure_type(ep["filename"]))
 
         if ep["duration"]:
             fe.podcast.itunes_duration(ep["duration"])

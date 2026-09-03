@@ -190,8 +190,37 @@ def test_api_state_shape():
     resp = main.api_state()
     import json
     data = json.loads(resp.body)
-    for key in ("channels", "unsubscribed", "orphans", "cookies", "email", "next_poll", "jobs", "version"):
+    for key in ("channels", "unsubscribed", "orphans", "total_bytes", "cookies",
+                "email", "next_poll", "jobs", "version"):
         assert key in data
+
+
+def test_api_state_reports_storage(tmp_path, monkeypatch):
+    """/api/state's byte figures must reflect real files on disk, per-channel
+    and in total."""
+    import json
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "state.db"))
+    monkeypatch.setattr(downloader, "AUDIO_DIR", str(tmp_path / "audio"))
+    monkeypatch.setattr(downloader, "THUMBNAIL_DIR", str(tmp_path / "thumb"))
+    db.init_db()
+
+    cid = "UCstorage1234567890123456"
+    url = "https://www.youtube.com/@Storage"
+    db.add_channel(url)
+    db.update_channel_meta(url, cid, "Storage Chan")
+
+    audio_dir = downloader._audio_dir_for(cid)
+    thumb_dir = downloader._thumbnail_dir_for(cid)
+    with open(os.path.join(audio_dir, "v001.mp3"), "wb") as f:
+        f.write(b"a" * 1000)
+    with open(os.path.join(thumb_dir, "v001.jpg"), "wb") as f:
+        f.write(b"t" * 500)
+
+    resp = main.api_state()
+    data = json.loads(resp.body)
+    ch = next(c for c in data["channels"] if c["channel_id"] == cid)
+    assert ch["bytes"] == 1500
+    assert data["total_bytes"] == 1500
 
 
 def test_api_channel_episodes_rejects_bad_id():

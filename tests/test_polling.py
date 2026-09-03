@@ -1,6 +1,8 @@
 """Tests for the episode cap (prune) and members-only skip behavior."""
 import os
+import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 
 from app import database as db, downloader
 
@@ -152,7 +154,7 @@ def test_poll_does_not_redownload_pruned_video(tmp_path, monkeypatch):
 
     downloaded = []
 
-    def _fake_download(entry, cid, cname):
+    def _fake_download(entry, cid, cname, **_kw):
         vid = entry["id"]
         path = os.path.join(downloader._audio_dir_for(cid), f"{vid}.mp3")
         if os.path.exists(path):
@@ -223,7 +225,7 @@ def _stub_poll_io(monkeypatch, entries):
     that records the ids actually handed to _download_entry."""
     downloaded_ids = []
 
-    def _fake_download(entry, cid, cname):
+    def _fake_download(entry, cid, cname, **_kw):
         downloaded_ids.append(entry["id"])
         return _ep(int(entry["id"][1:]), cid)
 
@@ -499,7 +501,7 @@ def test_download_single_prunes_over_cap_channel(tmp_path, monkeypatch):
     monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL",
                         lambda *a, **k: _FakeYDL(info))
     monkeypatch.setattr(downloader, "_download_entry",
-                        lambda entry, cid, cname: _ep(5, cid))
+                        lambda entry, cid, cname, **_kw: _ep(5, cid))
 
     downloader.download_single("https://youtu.be/vNEW00000001", subscribe=False)
 
@@ -781,3 +783,243 @@ def test_poll_all_survives_a_failing_disk_check(tmp_path, monkeypatch):
     downloader.poll_all()  # remediation failing must never abort the run
 
     assert polled == ["https://x"]
+
+
+# --- configurable audio codec/bitrate ----------------------------------------
+
+def test_ydl_opts_defaults_unchanged(tmp_path, monkeypatch):
+    """Regression guard: with the defaults, _ydl_opts() must still produce
+    byte-for-byte the same postprocessor options as before this change."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "AUDIO_CODEC", "mp3")
+    monkeypatch.setattr(downloader, "AUDIO_BITRATE_KBPS", "128")
+    opts = downloader._ydl_opts(CID)
+    assert opts["postprocessors"] == [{
+        "key": "FFmpegExtractAudio",
+        "preferredcodec": "mp3",
+        "preferredquality": "128",
+    }]
+    assert opts["outtmpl"].endswith("%(id)s.%(ext)s")
+
+
+def test_ydl_opts_honours_codec_and_bitrate(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "AUDIO_CODEC", "opus")
+    monkeypatch.setattr(downloader, "AUDIO_BITRATE_KBPS", "64")
+    opts = downloader._ydl_opts(CID)
+    assert opts["postprocessors"][0]["preferredcodec"] == "opus"
+    assert opts["postprocessors"][0]["preferredquality"] == "64"
+    assert downloader._audio_ext() == "opus"
+
+
+def test_unknown_codec_falls_back_to_mp3(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "AUDIO_CODEC", "flurble")
+    assert downloader._audio_ext() == "mp3"
+    opts = downloader._ydl_opts(CID)
+    assert opts["postprocessors"][0]["preferredcodec"] == "mp3"
+
+
+def test_download_entry_skips_existing_file_in_other_format(tmp_path, monkeypatch):
+    """Flipping AUDIO_CODEC must not make an already-downloaded episode look
+    missing and re-download the whole library."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "AUDIO_CODEC", "opus")
+    audio_dir = downloader._audio_dir_for(CID)
+    open(os.path.join(audio_dir, "vAAAAAAAAAA.mp3"), "wb").close()
+
+    def _boom(*a, **k):
+        raise AssertionError("yt-dlp must not be invoked for an already-downloaded video")
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", _boom)
+
+    result = downloader._download_entry({"id": "vAAAAAAAAAA"}, CID, "C")
+    assert result is None
+
+
+# --- age-based retention ------------------------------------------------------
+
+def _ep_aged(i, days_old, cid=CID):
+    published = (datetime.now(timezone.utc) - timedelta(days=days_old)).isoformat()
+    return {
+        "id": f"v{i:03d}", "channel_id": cid, "channel_name": "C",
+        "title": f"t{i}", "description": "", "published": published,
+        "duration": 1, "filename": f"v{i:03d}.mp3", "filesize": 1, "thumbnail": None,
+    }
+
+
+def test_prune_removes_aged_out_episodes(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 100)  # count cap inert
+    monkeypatch.setattr(downloader, "MAX_EPISODE_AGE_DAYS", 30)
+    ages = {0: 1, 1: 5, 2: 40, 3: 400}
+    audio_dir = downloader._audio_dir_for(CID)
+    for i, days_old in ages.items():
+        ep = _ep_aged(i, days_old)
+        db.upsert_episode(ep)
+        open(os.path.join(audio_dir, ep["filename"]), "wb").close()
+
+    downloader._prune_channel(CID)
+
+    remaining = {e["id"] for e in db.get_episodes(CID)}
+    assert remaining == {"v000", "v001"}
+    assert db.get_skip_video_ids(CID) == {"v002", "v003"}
+    assert not os.path.exists(os.path.join(audio_dir, "v002.mp3"))
+    assert not os.path.exists(os.path.join(audio_dir, "v003.mp3"))
+    assert os.path.exists(os.path.join(audio_dir, "v000.mp3"))
+    assert os.path.exists(os.path.join(audio_dir, "v001.mp3"))
+
+
+def test_prune_age_disabled_by_default(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 100)
+    monkeypatch.setattr(downloader, "MAX_EPISODE_AGE_DAYS", 0)
+    for i, days_old in {0: 1, 1: 5, 2: 40, 3: 400}.items():
+        db.upsert_episode(_ep_aged(i, days_old))
+
+    downloader._prune_channel(CID)
+
+    assert len(db.get_episodes(CID)) == 4
+
+
+def test_prune_applies_both_caps(tmp_path, monkeypatch):
+    """An episode can be dropped either for being over the count cap or too
+    old — both apply, independently, and record the matching reason."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 3)
+    monkeypatch.setattr(downloader, "MAX_EPISODE_AGE_DAYS", 30)
+    # By age (newest first): v000(1d), v001(2d), v003(40d), v002(50d), v004(60d), v005(70d).
+    # v003 ranks inside the top-3 count-cap slice but is still past the 30-day
+    # age cap, so it must be dropped for "aged_out" specifically — the other
+    # two dropped episodes (v002, v004... wait v005) are dropped for "pruned"
+    # (over the count cap) regardless of age.
+    episodes = [
+        _ep_aged(0, 1), _ep_aged(1, 2), _ep_aged(3, 40),
+        _ep_aged(2, 50), _ep_aged(4, 60), _ep_aged(5, 70),
+    ]
+    for ep in episodes:
+        db.upsert_episode(ep)
+
+    downloader._prune_channel(CID)
+
+    remaining = {e["id"] for e in db.get_episodes(CID)}
+    skipped = db.get_skip_video_ids(CID)
+    assert remaining | skipped == {f"v{i:03d}" for i in range(6)}
+    assert remaining.isdisjoint(skipped)
+    # v003 (40 days old) must be gone regardless of cap position.
+    assert "v003" not in remaining
+
+    with sqlite3.connect(db.DB_PATH) as conn:
+        rows = conn.execute("SELECT video_id, reason FROM skip_videos WHERE channel_id=?", (CID,)).fetchall()
+    reasons = {vid: reason for vid, reason in rows}
+    assert reasons.get("v003") == "aged_out"
+    assert any(r == "pruned" for r in reasons.values())
+
+
+# --- max-duration filter ------------------------------------------------------
+
+def test_poll_skips_over_long_entry_before_download(tmp_path, monkeypatch):
+    """A flat listing entry that already carries a duration over the cap must
+    never reach _download_entry (no bandwidth wasted), and must stay skipped
+    on the next poll."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+    url = "https://www.youtube.com/@SomeChannel"
+    db.add_channel(url)
+
+    entries = [
+        {"id": "v000", "availability": None, "duration": 600},
+        {"id": "v001", "availability": None, "duration": 7200},  # over cap
+    ]
+    downloaded_ids = _stub_poll_io(monkeypatch, entries)
+
+    downloader.poll_channel(url)
+    assert downloaded_ids == ["v000"]
+    assert "v001" in db.get_skip_video_ids(CID)
+
+    # Second poll: the over-long entry is skipped instantly, never re-attempted
+    # (v000 is re-"downloaded" here only because _stub_poll_io's fake never
+    # checks file existence like the real _download_entry does).
+    downloaded_ids.clear()
+    downloader.poll_channel(url)
+    assert "v001" not in downloaded_ids
+
+
+def test_poll_discards_over_long_video_after_download(tmp_path, monkeypatch):
+    """A live-stream/premiere entry with no flat duration is caught by the
+    post-download backstop instead."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+    url = "https://www.youtube.com/@SomeChannel"
+    db.add_channel(url)
+
+    entries = [{"id": "v000", "availability": None, "duration": None}]
+
+    def _fake_download(entry, cid, cname, **_kw):
+        raise downloader.TooLongError("v000")
+
+    monkeypatch.setattr(downloader, "_fetch_channel_entries",
+                        lambda *a, **k: (entries, CID, "C"))
+    monkeypatch.setattr(downloader, "_download_entry", _fake_download)
+    monkeypatch.setattr(downloader, "valid_cookie_file", lambda _p: True)
+    monkeypatch.setattr(downloader.time, "sleep", lambda _s: None)
+
+    result = downloader.poll_channel(url)
+
+    assert result["downloaded"] == 0
+    assert "v000" in db.get_skip_video_ids(CID)
+    assert db.get_episodes(CID) == []
+
+
+def test_download_entry_deletes_over_long_file(tmp_path, monkeypatch):
+    """Exercise the real _download_entry: the just-downloaded file must be
+    removed and TooLongError raised when the real duration exceeds the cap."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+    audio_dir = downloader._audio_dir_for(CID)
+
+    class _FakeDownloadYDL:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, *a, **k):
+            open(os.path.join(audio_dir, "vAAAAAAAAAA.mp3"), "wb").close()
+            return {"id": "vAAAAAAAAAA", "duration": 7200, "title": "x",
+                    "upload_date": "20260101"}
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", lambda *a, **k: _FakeDownloadYDL())
+
+    try:
+        downloader._download_entry({"id": "vAAAAAAAAAA"}, CID, "C")
+        assert False, "expected TooLongError"
+    except downloader.TooLongError:
+        pass
+    assert not os.path.exists(os.path.join(audio_dir, "vAAAAAAAAAA.mp3"))
+
+
+def test_download_single_ignores_duration_cap(tmp_path, monkeypatch):
+    """One-off downloads are an explicit user request — they warn but still
+    download an over-long video."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+
+    info = {"id": "vNEW00000001", "channel_id": CID, "channel": "C", "duration": 7200}
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", lambda *a, **k: _FakeYDL(info))
+
+    calls = []
+
+    def _fake_download(entry, cid, cname, **kw):
+        calls.append(kw)
+        return _ep(0, cid)
+
+    monkeypatch.setattr(downloader, "_download_entry", _fake_download)
+
+    downloader.download_single("https://youtu.be/vNEW00000001", subscribe=False)
+
+    assert calls == [{"enforce_duration": False}]
+    assert len(db.get_episodes(CID)) == 1

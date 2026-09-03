@@ -8,6 +8,17 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.13.0",
+        "date": "2026-09-03",
+        "changes": [
+            "Audio codec and bitrate are now configurable: new AUDIO_CODEC (default 'mp3') and AUDIO_BITRATE_KBPS (default '128') env vars. Setting AUDIO_CODEC=opus roughly halves file size at equivalent quality, but Opus isn't universally supported by podcast apps (notably Apple Podcasts and Pocket Casts) — check your app before switching. Changing this only affects new downloads: existing .mp3 episodes are never re-encoded, so a feed can end up mixing .mp3 and .opus items, which is fine (both are valid enclosures) but worth expecting.",
+            "New MAX_EPISODE_AGE_DAYS setting (default 0, disabled) prunes episodes older than N days, on top of the existing MAX_EPISODES_PER_CHANNEL count cap — either cap can drop an episode independently, and dropped episodes are remembered so they're never re-downloaded.",
+            "New MAX_EPISODE_DURATION_MINUTES setting (default 0, disabled) skips videos longer than N minutes during channel polls — aimed at multi-hour livestreams that can otherwise eat most of a channel's disk budget on their own. Most over-long videos are caught before downloading (channel listings usually carry a duration); live streams and premieres that don't report one are caught right after download instead, with the file deleted immediately. One-off (single-video) downloads are exempt from this cap, since they're an explicit request — they log a warning and download anyway.",
+            "The dashboard now shows disk usage: a per-channel size badge next to the episode count, and a total 'on disk' figure for all subscribed channels, both computed live from the audio and thumbnail directories.",
+            "These are global settings only — per-channel overrides (different caps or codec per channel) are not yet supported.",
+        ],
+    },
+    {
         "version": "1.12.0",
         "date": "2026-09-03",
         "changes": [

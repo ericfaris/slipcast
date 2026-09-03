@@ -81,9 +81,13 @@ All configuration is via environment variables in `docker-compose.yml`. Credenti
 | `AUTH_USERS` | *(none)* | Multi-user credentials, e.g. `alice:pass1,bob:pass2` — takes precedence over `AUTH_USER`/`AUTH_PASS` |
 | `DATA_DIR` | `/data` | Where audio, thumbnails, and the database are stored |
 | `MAX_EPISODES_PER_CHANNEL` | `20` | How many episodes to keep per channel |
+| `MAX_EPISODE_AGE_DAYS` | `0` (disabled) | Also prune episodes older than this many days, in addition to the count cap above |
+| `MAX_EPISODE_DURATION_MINUTES` | `0` (disabled) | Don't download channel videos longer than this many minutes (one-off downloads are exempt — see "Important notes") |
 | `MIN_FREE_DISK_GB` | `2` | Below this many GB free on the `DATA_DIR` filesystem, the globally oldest episodes are deleted before polling (`0` disables); always emails what it removed |
 | `POLL_INTERVAL_HOURS` | `2` | How often to check subscribed channels for new videos |
 | `POLL_CONCURRENCY` | `2` | Max channels polled at once by "poll all"/"poll selected" |
+| `AUDIO_CODEC` | `mp3` | Audio codec for new downloads — `mp3` or `opus` (roughly half the size at equivalent quality, but not universally supported — see "Important notes") |
+| `AUDIO_BITRATE_KBPS` | `128` | Audio bitrate for new downloads |
 | `COOKIES_FILE` | *(none)* | Path to YouTube cookies file (upload via UI, then uncomment) |
 | `SMTP_HOST` | *(none)* | SMTP server for cookie-expiry email alerts (e.g. `smtp.gmail.com`) |
 | `SMTP_PORT` | `587` | SMTP port |
@@ -99,6 +103,9 @@ All configuration is via environment variables in `docker-compose.yml`. Credenti
 - The management UI (`/`) requires Basic Auth. Feed and audio endpoints (`/feed/`, `/audio/`) are public so podcast apps can access them without credentials.
 - YouTube cookies expire every few weeks. When downloads start failing, re-upload cookies via the management UI and uncomment `COOKIES_FILE`.
 - The container has a Docker `HEALTHCHECK` (mirrored in `docker-compose.yml`) that hits `/health/live` — the restart-fixable subset of the health report, deliberately not the full `/health` (which also fails on expired cookies, something no restart repairs). With `restart: unless-stopped`, Docker Compose does **not** automatically restart a container just because it's marked unhealthy — the healthcheck only makes the status visible (`docker compose ps`, `docker inspect`). For an actual restart-on-unhealthy, install the host-side autoheal timer: see [ops/README.md](ops/README.md).
+- Changing `AUDIO_CODEC` mid-flight is safe but produces a feed mixing `.mp3` and `.opus` episodes — both are valid enclosures, and old files are never re-encoded, so this is expected rather than a bug. Opus isn't universally supported by podcast apps — check compatibility (notably Apple Podcasts and Pocket Casts) before switching.
+- `MAX_EPISODE_DURATION_MINUTES` only applies to channel polls. A one-off download of a video over the cap still downloads — it's an explicit request — but logs a warning.
+- `MAX_EPISODE_AGE_DAYS`, `MAX_EPISODE_DURATION_MINUTES`, `AUDIO_CODEC`, and `AUDIO_BITRATE_KBPS` are global settings — **per-channel overrides are not yet supported.**
 
 ---
 
@@ -107,7 +114,7 @@ All configuration is via environment variables in `docker-compose.yml`. Credenti
 Visit `https://yourapp/` and log in with your `AUTH_USER` / `AUTH_PASS`.
 
 ### Subscribed Channels
-Channels being polled automatically on your schedule.
+Channels being polled automatically on your schedule. Each channel card shows a disk-usage badge (audio + thumbnails), and the section header shows the total across all subscribed channels.
 
 | Action | Description |
 |---|---|
@@ -191,7 +198,7 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
 |---|---|---|---|
 | `GET` | `/` | Required | Management UI |
 | `GET` | `/feed/<channel_id>.xml` | None | RSS feed for a channel |
-| `GET` | `/audio/<channel_id>/<file>.mp3` | None | Audio file stream |
+| `GET` | `/audio/<channel_id>/<file>` | None | Audio file stream (extension depends on `AUDIO_CODEC` — `.mp3` or `.opus`) |
 | `GET` | `/thumbnails/<channel_id>/<file>.jpg` | None | Thumbnail image |
 | `GET` | `/health` | None | Full health report — 200 `{"status":"ok",...}` when healthy, 503 `{"status":"degraded",...}` (with a `checks`/`problems` breakdown) if the scheduler isn't running, polling has gone stale (no run in ~3x `POLL_INTERVAL_HOURS`, past an initial startup grace period), or cookies are missing/expired. This is the one to read yourself; automation should use `/health/live` |
 | `GET` | `/health/live` | None | Liveness check — the same report **minus** the cookie check: 200 only when a restart would plausibly help (scheduler running, polling not stalled). Expired cookies and low disk deliberately do **not** fail it, since restarting fixes neither. This is what the Docker healthcheck and [ops/autoheal.sh](ops/README.md) watch |
@@ -211,10 +218,10 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
 ## How It Works
 
 1. **Polling** — on startup and every `POLL_INTERVAL_HOURS`, yt-dlp fetches the `/videos` tab of each subscribed channel
-2. **Filtering** — member-only, subscriber-only, and premium videos are skipped during automatic polls
-3. **Downloading** — new videos are downloaded as MP3 (128kbps) to `DATA_DIR/audio/<channel_id>/`
+2. **Filtering** — member-only, subscriber-only, and premium videos are skipped during automatic polls, as is anything longer than `MAX_EPISODE_DURATION_MINUTES` (when set)
+3. **Downloading** — new videos are downloaded as MP3 (128 kbps by default — see `AUDIO_CODEC`/`AUDIO_BITRATE_KBPS`) to `DATA_DIR/audio/<channel_id>/`
 4. **Thumbnails** — channel cover art and per-episode thumbnails are downloaded and converted to JPEG (YouTube often serves WebP; ffmpeg converts them for podcast app compatibility)
-5. **Pruning** — once a channel exceeds `MAX_EPISODES_PER_CHANNEL`, the oldest episodes are deleted. Separately, if free disk falls below `MIN_FREE_DISK_GB`, the oldest episodes **across all channels** are deleted at the start of a poll until it's back above the line (you get an email listing them)
+5. **Pruning** — once a channel exceeds `MAX_EPISODES_PER_CHANNEL`, or an episode exceeds `MAX_EPISODE_AGE_DAYS` (when set), it's deleted. Separately, if free disk falls below `MIN_FREE_DISK_GB`, the oldest episodes **across all channels** are deleted at the start of a poll until it's back above the line (you get an email listing them)
 6. **Feed generation** — RSS feeds are built dynamically from the SQLite database on each request
 7. **Deduplication** — already-downloaded files are skipped by file existence check
 
@@ -230,7 +237,7 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
 │   └── episodes-YYYYMMDD-HHMMSS.db
 ├── audio/
 │   └── <channel_id>/
-│       ├── <video_id>.mp3
+│       ├── <video_id>.mp3   # or <video_id>.opus, depending on AUDIO_CODEC when downloaded
 │       └── ...
 └── thumbnails/
     └── <channel_id>/
