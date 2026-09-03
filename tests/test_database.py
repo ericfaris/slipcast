@@ -288,3 +288,165 @@ def test_run_backup_job_prunes_to_retention(tmp_path, monkeypatch):
     remaining = sorted(p.name for p in backups.iterdir())
     assert len(remaining) == db._BACKUP_RETAIN
     assert remaining[-1].startswith("episodes-20")  # today's snapshot survives
+
+
+# --- feed tokens, settings, combined episodes -------------------------------
+
+def _legacy_db(tmp_path, monkeypatch):
+    """Build a pre-v1.14 database by hand (no feed_token / itunes_* / settings).
+
+    Creating it with raw SQL rather than an older init_db() is the only way to
+    prove the migration actually adds the columns to an existing file.
+    """
+    import sqlite3
+    path = str(tmp_path / "legacy.db")
+    monkeypatch.setattr(db, "DB_PATH", path)
+    conn = sqlite3.connect(path)
+    conn.execute("""CREATE TABLE channels (
+        url TEXT PRIMARY KEY, channel_id TEXT, channel_name TEXT,
+        added_at TEXT NOT NULL DEFAULT (datetime('now')))""")
+    conn.execute("""CREATE TABLE unsubscribed_channels (
+        channel_id TEXT PRIMARY KEY, channel_name TEXT)""")
+    conn.execute("INSERT INTO channels (url, channel_id, channel_name) VALUES (?, ?, ?)",
+                 ("https://www.youtube.com/@A", CID, "A"))
+    conn.execute("INSERT INTO channels (url) VALUES (?)",
+                 ("https://www.youtube.com/@Unpolled",))  # channel_id still NULL
+    conn.execute("INSERT INTO unsubscribed_channels (channel_id, channel_name) VALUES (?, ?)",
+                 (CID2, "B"))
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _tokens():
+    with db.get_conn() as conn:
+        rows = conn.execute("SELECT url, feed_token FROM channels").fetchall()
+        un = conn.execute(
+            "SELECT channel_id, feed_token FROM unsubscribed_channels").fetchall()
+    return {r["url"]: r["feed_token"] for r in rows} | {r["channel_id"]: r["feed_token"] for r in un}
+
+
+def test_migration_adds_columns_and_backfills_tokens(tmp_path, monkeypatch):
+    _legacy_db(tmp_path, monkeypatch)
+    db.init_db()
+    with db.get_conn() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
+        un_cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(unsubscribed_channels)").fetchall()}
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert {"feed_token", "itunes_category", "itunes_language", "itunes_explicit"} <= cols
+    assert "feed_token" in un_cols
+    assert "settings" in tables
+
+    tokens = _tokens()
+    assert len(tokens) == 3
+    assert all(t for t in tokens.values())          # every row got one
+    assert len(set(tokens.values())) == 3           # and each is distinct
+
+
+def test_migration_is_idempotent_and_never_rotates_tokens(tmp_path, monkeypatch):
+    """init_db() runs on EVERY startup. A rotated token would silently break
+    every already-subscribed podcast app once enforcement is on — the worst
+    failure mode in this feature."""
+    _legacy_db(tmp_path, monkeypatch)
+    db.init_db()
+    before = _tokens()
+    all_before = db.get_or_create_all_feed_token()
+
+    db.init_db()
+    db.init_db()
+
+    assert _tokens() == before
+    assert db.get_or_create_all_feed_token() == all_before
+
+
+def test_get_or_create_feed_token_is_stable(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    url = "https://www.youtube.com/@A"
+    db.add_channel(url)
+    db.update_channel_meta(url, CID, "A")
+    first = db.get_or_create_feed_token(CID)
+    assert first
+    assert db.get_or_create_feed_token(CID) == first
+    assert db.get_feed_token(CID) == first
+
+
+def test_get_or_create_feed_token_covers_a_row_added_after_migration(tmp_path, monkeypatch):
+    """A channels row's channel_id is NULL until the first successful poll, so
+    the init_db() backfill can't key on it — the lazy path has to."""
+    _setup_tmp(tmp_path, monkeypatch)
+    db.upsert_unsubscribed_channel(CID2, "B")
+    token = db.get_or_create_feed_token(CID2)
+    assert token and db.get_feed_token(CID2) == token
+
+
+def test_feed_token_is_none_for_unknown_channel(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    assert db.get_feed_token("UCnothing1234567890123456") is None
+    assert db.get_or_create_feed_token("UCnothing1234567890123456") is None
+
+
+def test_all_feed_token_is_stable(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    first = db.get_or_create_all_feed_token()
+    assert first
+    assert db.get_or_create_all_feed_token() == first
+    assert db.get_setting("all_feed_token") == first
+
+
+def test_settings_roundtrip(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    assert db.get_setting("nope") is None
+    db.set_setting("k", "v1")
+    db.set_setting("k", "v2")
+    assert db.get_setting("k") == "v2"
+
+
+def test_get_episode_returns_none_for_unknown(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    assert db.get_episode("nope") is None
+    db.upsert_episode(_ep(1))
+    assert db.get_episode("v001")["title"] == "t1"
+
+
+def test_get_combined_episodes_excludes_unsubscribed_and_dedupes(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    # Two channels rows sharing one channel_id — a JOIN would double the items.
+    db.add_channel("https://www.youtube.com/@A")
+    db.update_channel_meta("https://www.youtube.com/@A", CID, "A")
+    db.add_channel("https://www.youtube.com/channel/" + CID)
+    db.update_channel_meta("https://www.youtube.com/channel/" + CID, CID, "A")
+    db.upsert_unsubscribed_channel(CID2, "B")
+
+    db.upsert_episode(_ep(1, CID))
+    db.upsert_episode(_ep(2, CID))
+    db.upsert_episode(_ep(3, CID2))  # one-off — must not appear
+
+    rows = db.get_combined_episodes(100)
+    assert [r["id"] for r in rows] == ["v002", "v001"]  # newest first, no dupes
+
+
+def test_get_combined_episodes_respects_limit(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    db.add_channel("https://www.youtube.com/@A")
+    db.update_channel_meta("https://www.youtube.com/@A", CID, "A")
+    for i in range(1, 8):
+        db.upsert_episode(_ep(i))
+    rows = db.get_combined_episodes(3)
+    assert [r["id"] for r in rows] == ["v007", "v006", "v005"]
+
+
+def test_channel_feed_settings_roundtrip(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    assert db.get_channel_feed_settings(CID) is None  # unknown channel
+    db.add_channel("https://www.youtube.com/@A")
+    db.update_channel_meta("https://www.youtube.com/@A", CID, "A")
+    row = db.get_channel_feed_settings(CID)
+    assert (row["itunes_category"], row["itunes_language"], row["itunes_explicit"]) \
+        == (None, None, None)
+    db.set_channel_feed_settings(CID, "Comedy", "es", "clean")
+    row = db.get_channel_feed_settings(CID)
+    assert row["itunes_category"] == "Comedy"
+    db.set_channel_feed_settings(CID, None, None, None)
+    assert db.get_channel_feed_settings(CID)["itunes_category"] is None

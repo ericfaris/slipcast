@@ -86,6 +86,8 @@ All configuration is via environment variables in `docker-compose.yml`. Credenti
 | `MIN_FREE_DISK_GB` | `2` | Below this many GB free on the `DATA_DIR` filesystem, the globally oldest episodes are deleted before polling (`0` disables); always emails what it removed |
 | `POLL_INTERVAL_HOURS` | `2` | How often to check subscribed channels for new videos |
 | `POLL_CONCURRENCY` | `2` | Max channels polled at once by "poll all"/"poll selected" |
+| `REQUIRE_FEED_TOKENS` | `false` | Require `?token=<feed_token>` on every feed request (see "Feed access tokens") — off by default so existing podcast-app subscriptions keep working |
+| `ALL_FEED_MAX_EPISODES` | `100` | Max items in the combined `/feed/all.xml` across all subscribed channels |
 | `AUDIO_CODEC` | `mp3` | Audio codec for new downloads — `mp3` or `opus` (roughly half the size at equivalent quality, but not universally supported — see "Important notes") |
 | `AUDIO_BITRATE_KBPS` | `128` | Audio bitrate for new downloads |
 | `COOKIES_FILE` | *(none)* | Path to YouTube cookies file (upload via UI, then uncomment) |
@@ -118,9 +120,18 @@ Channels being polled automatically on your schedule. Each channel card shows a 
 
 | Action | Description |
 |---|---|
-| **Copy** | Copies the RSS feed URL to your clipboard |
+| **Share** | Shows the RSS feed URL (with its access token), a QR code, and one-tap podcast-app links |
+| **Feed settings** | Sets this channel's iTunes category, language, and explicit flag — leave a field blank to keep the default (Technology / en / no) |
 | **Poll Now** | Triggers an immediate download check in the background |
 | **Remove** | Unsubscribes and deletes all downloaded files for that channel |
+
+Clicking a channel's episode-count badge opens its episode list, where each episode has:
+
+| Action | Description |
+|---|---|
+| **Play** | Streams the audio inline |
+| **Re-download** | Fetches the video again, replacing the file on disk — the fix for a truncated or corrupt download |
+| **Delete** | Removes the audio, thumbnail, and database row. Unlike an automatic prune this does **not** blacklist the video, so a later poll can pick it up again |
 
 ### One-off Downloads
 Episodes downloaded individually without subscribing to the channel. These have a feed URL you can use in your podcast app, but the channel won't be polled automatically.
@@ -190,6 +201,31 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
 
 > **Note:** Some podcast apps (including Pocket Casts) fetch feeds through their own servers rather than directly from your device. In this case `BASE_URL` must be a publicly reachable URL. See [CLOUDFLARE_TUNNEL.md](CLOUDFLARE_TUNNEL.md).
 
+### Combined feed
+
+Every **subscribed** channel is also served as one merged podcast at:
+```
+https://yourapp/feed/all.xml
+```
+Newest episode first, across all channels, capped at `ALL_FEED_MAX_EPISODES` (default 100). One-off downloads are deliberately excluded. The dashboard's **Share all-channels feed** button (next to the "Subscribed channels" heading) gives you the URL, a QR code, and the usual Pocket Casts / Apple Podcasts links.
+
+### Feed access tokens
+
+A feed URL is just `/feed/<channel_id>.xml`, and `channel_id` is YouTube's own public channel ID — so anyone who knows or guesses it can fetch your audio. Each channel (and the combined feed) therefore has a secret `feed_token`, which the dashboard automatically appends to every feed URL it hands you:
+
+```
+https://yourapp/feed/<channel_id>.xml?token=<feed_token>
+```
+
+Set `REQUIRE_FEED_TOKENS=true` and restart to make the token mandatory; requests without a matching token then return **404** (not 401 — an unauthenticated caller shouldn't be able to tell "wrong token" from "no such channel").
+
+**Be clear about what this does and doesn't do:**
+
+- ✅ It stops someone **guessing or enumerating** a feed URL from reaching your audio.
+- ❌ It does **not** protect a URL that has already been shared, logged by a proxy, or copied off a screen. It's a shared secret in a URL — the same model as most podcast apps' "private feed" links — not per-listener authentication. There are no accounts, no per-device tokens, no rotation, and no expiry.
+
+Tokens are generated for every channel as soon as you upgrade, regardless of whether enforcement is on. That means **turning `REQUIRE_FEED_TOKENS` on later does not invalidate feed URLs already saved in your podcast app** — the token they embedded is the same one being checked. If you copied a URL before upgrading (no `?token=` on it), copy a fresh one from the dashboard before enabling enforcement.
+
 ---
 
 ## API Endpoints
@@ -197,7 +233,8 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/` | Required | Management UI |
-| `GET` | `/feed/<channel_id>.xml` | None | RSS feed for a channel |
+| `GET` | `/feed/<channel_id>.xml` | None | RSS feed for a channel (accepts an optional `?token=` — required when `REQUIRE_FEED_TOKENS=true`) |
+| `GET` | `/feed/all.xml` | None | Combined RSS feed across all subscribed channels, newest first, capped at `ALL_FEED_MAX_EPISODES` (same optional `?token=`) |
 | `GET` | `/audio/<channel_id>/<file>` | None | Audio file stream (extension depends on `AUDIO_CODEC` — `.mp3` or `.opus`) |
 | `GET` | `/thumbnails/<channel_id>/<file>.jpg` | None | Thumbnail image |
 | `GET` | `/health` | None | Full health report — 200 `{"status":"ok",...}` when healthy, 503 `{"status":"degraded",...}` (with a `checks`/`problems` breakdown) if the scheduler isn't running, polling has gone stale (no run in ~3x `POLL_INTERVAL_HOURS`, past an initial startup grace period), or cookies are missing/expired. This is the one to read yourself; automation should use `/health/live` |
@@ -211,6 +248,9 @@ Subscribe to feed URLs in any podcast app (Pocket Casts, AntennaPod, Overcast, A
 | `POST` | `/channels/remove-unsubscribed` | Required | Remove a one-off (unsubscribed) channel and its files (form) |
 | `POST` | `/channels/remove-orphan` | Required | Delete leftover data for a channel with no owning row — see Orphaned Data below (form) |
 | `POST` | `/episodes/download` | Required | Download a specific episode (form) |
+| `POST` | `/episodes/delete` | Required | Delete one episode's audio, thumbnail, and row (form: `episode_id`) |
+| `POST` | `/episodes/redownload` | Required | Force a fresh download of one episode, replacing the file on disk (form: `episode_id`) |
+| `POST` | `/channels/feed-settings` | Required | Set a channel's iTunes category/language/explicit overrides (form) |
 | `POST` | `/auth/cookies` | Required | Upload YouTube cookies file (max 5 MB) |
 
 ---

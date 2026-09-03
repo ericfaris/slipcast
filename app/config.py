@@ -70,3 +70,17 @@ MAX_EPISODE_AGE_DAYS = int(os.environ.get("MAX_EPISODE_AGE_DAYS", "0"))
 # request); they only log a warning.
 MAX_EPISODE_DURATION_MINUTES = int(os.environ.get("MAX_EPISODE_DURATION_MINUTES", "0"))
 
+# --- Feed access / combined feed ----------------------------------------------
+# Feed URLs are public by design (podcast apps can't send Basic Auth), which
+# also means /feed/<channel_id>.xml is guessable — channel_id is YouTube's own
+# public ID. When this is on, every feed request must carry the matching
+# ?token=<feed_token>. It defaults to OFF so turning Slipcast up on an existing
+# install doesn't silently break feeds already subscribed in a podcast app;
+# tokens are still generated and embedded in every dashboard-copied URL either
+# way, so flipping this on later needs no migration and doesn't invalidate URLs
+# already saved (their embedded token is the same one).
+REQUIRE_FEED_TOKENS = os.environ.get("REQUIRE_FEED_TOKENS", "").strip().lower() in ("1", "true", "yes", "on")
+# Cap on items in the combined /feed/all.xml. Unlike the per-channel feed
+# (MAX_EPISODES_PER_CHANNEL), this one merges every subscribed channel, so
+# without a cap it would grow with the whole library.
+ALL_FEED_MAX_EPISODES = int(os.environ.get("ALL_FEED_MAX_EPISODES", "100"))

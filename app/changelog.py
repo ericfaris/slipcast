@@ -8,6 +8,16 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.14.0",
+        "date": "2026-09-03",
+        "changes": [
+            "Feed URLs can now be protected with an access token. Every feed URL used to be guessable — it's just /feed/<channel_id>.xml, and the channel ID is YouTube's own public one — so anyone who worked one out could pull your audio. Each channel now has a secret token that the dashboard automatically appends to the URL you copy. Enforcement is OFF by default so nothing breaks on upgrade: set REQUIRE_FEED_TOKENS=true and restart to require it, and because the token was already embedded in the URLs you copied earlier, feeds already subscribed in your podcast app keep working. This guards against someone guessing a feed URL — it is not real per-listener authentication, since the token travels in the URL like every other private podcast feed.",
+            "New combined feed at /feed/all.xml: every subscribed channel merged into one podcast, newest episode first, capped by the new ALL_FEED_MAX_EPISODES setting (default 100). One-off downloads are deliberately left out. There's a 'Share all-channels feed' button next to the Subscribed channels heading, with the same QR code and copy affordances as a per-channel feed.",
+            "Individual episodes can now be deleted or re-downloaded from the episode list. Previously a single corrupt or truncated download could only be fixed by removing and re-adding the whole channel. Delete removes the audio, the thumbnail, and the database row — and unlike an automatic prune, it does not blacklist the video, so the next poll can pick it up again. Re-download forces a fresh fetch even when the file is already on disk, which is the fix for a file that downloaded incompletely.",
+            "Feeds can now carry per-channel iTunes metadata. Every feed was previously hardcoded to category 'Technology', language 'en', and explicit 'no' regardless of what the channel actually is. A new 'Feed settings' button on each subscribed channel opens a category / language / explicit form; anything you leave blank keeps today's default, so nothing changes until you set something.",
+        ],
+    },
+    {
         "version": "1.13.0",
         "date": "2026-09-03",
         "changes": [

@@ -1,4 +1,5 @@
 import base64
+import html
 import ipaddress
 import logging
 import os
@@ -24,14 +25,16 @@ from app import jobs
 from app import notify
 from app.safety import is_safe_media_name
 from app.config import (
-    AUDIO_DIR, ALERT_EMAIL, AUTH_CREDENTIALS, BASE_URL, COOKIES_FILE,
-    POLL_CONCURRENCY, POLL_INTERVAL_HOURS, THUMBNAIL_DIR,
+    AUDIO_DIR, ALERT_EMAIL, ALL_FEED_MAX_EPISODES, AUTH_CREDENTIALS, BASE_URL,
+    COOKIES_FILE, POLL_CONCURRENCY, POLL_INTERVAL_HOURS, REQUIRE_FEED_TOKENS,
+    THUMBNAIL_DIR,
 )
 from app.downloader import (
-    cookies_status, download_single, find_orphan_channels, poll_all,
-    poll_channel, remove_channel_data, storage_usage, valid_cookie_file,
+    cookies_status, delete_episode_files, download_single, find_orphan_channels,
+    poll_all, poll_channel, redownload_episode, remove_channel_data,
+    storage_usage, valid_cookie_file,
 )
-from app.feed import build_feed
+from app.feed import ITUNES_CATEGORIES, build_combined_feed, build_feed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -84,6 +87,13 @@ _failed_attempts: dict[str, list[float]] = defaultdict(list)
 _rate_limit_lock = threading.Lock()
 _CHANNEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_COOKIE_BYTES = 5 * 1024 * 1024  # 5 MB
+# The only values feedgen's itunes_explicit() accepts — anything else raises,
+# which on a feed build would be a 500 on a public endpoint.
+_EXPLICIT_VALUES = frozenset({"yes", "no", "clean"})
+# Loose BCP-47: "en", "en-US", "pt-BR". Deliberately not exhaustive — feedgen
+# doesn't validate the language tag at all, so this is only here to keep
+# obvious junk out of the feed, not to be a conformance checker.
+_LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")
 
 
 @asynccontextmanager
@@ -366,7 +376,40 @@ def _polling_state() -> dict:
 
 
 def _feed_url(channel_id: str) -> str:
-    return f"{BASE_URL}/feed/{channel_id}.xml"
+    """Absolute feed URL, carrying the channel's access token when it has one.
+
+    The token is appended even while REQUIRE_FEED_TOKENS is off, so a URL copied
+    from the dashboard today keeps working the moment enforcement is turned on —
+    that's the whole reason turning it on doesn't break existing subscriptions.
+
+    This is a get-or-create, so it can write; after the first call for a channel
+    (and init_db()'s backfill covers most of them before that) it's a pure read.
+    It runs once per channel inside api_state, which the dashboard polls every
+    few seconds — keep it out of any per-episode loop.
+    """
+    url = f"{BASE_URL}/feed/{channel_id}.xml"
+    token = db.get_or_create_feed_token(channel_id)
+    return f"{url}?token={token}" if token else url
+
+
+def _all_feed_url() -> str:
+    """Absolute combined-feed URL, with the install-wide token."""
+    return f"{BASE_URL}/feed/all.xml?token={db.get_or_create_all_feed_token()}"
+
+
+def _token_ok(expected: str | None, provided: str | None) -> bool:
+    """Constant-time feed-token check.
+
+    Inert (always True) while REQUIRE_FEED_TOKENS is off, and fails closed once
+    it's on: a channel with no stored token is not servable at all rather than
+    servable by anyone. The falsy guard also keeps compare_digest from raising
+    on a None (a missing ?token=), which would be a 500 on a public endpoint.
+    """
+    if not REQUIRE_FEED_TOKENS:
+        return True
+    if not expected or not provided:
+        return False
+    return secrets.compare_digest(expected, provided)
 
 
 def _channel_thumb_exists(channel_id: str) -> bool:
@@ -445,6 +488,24 @@ def _run_download(url: str, subscribe: bool):
     except Exception as exc:
         logger.exception("Download job failed for %s", url)
         jobs.finish(jid, "error", str(exc))
+
+
+def _run_redownload(video_id: str, channel_id: str, channel_name: str, title: str | None):
+    """Re-fetch one episode. Reported as a 'download' job so the dashboard's
+    existing spinner/toast handling covers it with no client changes."""
+    label = title or video_id
+    jid = jobs.start("download", label)
+    try:
+        result = redownload_episode(video_id, channel_id, channel_name)
+        if result:
+            db.upsert_episode(result)
+            jobs.finish(jid, "success", f"{label}: re-downloaded")
+        else:
+            jobs.finish(jid, "error",
+                        f"{label}: re-download failed — video may be unavailable or members-only")
+    except Exception as exc:
+        logger.exception("Re-download job failed for %s", video_id)
+        jobs.finish(jid, "error", f"{label}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +590,7 @@ _PAGE = """<!DOCTYPE html>
             <div class="section-head">
                 <h2 id="subs-h">Subscribed channels <span id="subs-count" class="count-pill"></span></h2>
                 <span id="subs-storage" class="pill"></span>
+                <button id="all-feed-share" class="btn btn-ghost btn-sm" type="button" hidden>Share all-channels feed</button>
             </div>
 
             <form id="add-form" class="inline-form" autocomplete="off">
@@ -642,6 +704,33 @@ _PAGE = """<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Per-channel feed settings dialog -->
+    <div id="fs-modal" class="modal" hidden>
+        <div class="modal-backdrop" data-close></div>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="fs-title">
+            <button class="modal-close" type="button" data-close aria-label="Close">&times;</button>
+            <h3 id="fs-title">Feed settings</h3>
+            <p id="fs-name" class="share-name"></p>
+            <form id="fs-form" class="fs-form" autocomplete="off">
+                <label class="fs-field" for="fs-category">iTunes category
+                    <select id="fs-category">__ITUNES_CATEGORY_OPTIONS__</select>
+                </label>
+                <label class="fs-field" for="fs-language">Language
+                    <input id="fs-language" type="text" placeholder="en (default)" maxlength="16">
+                </label>
+                <label class="fs-field" for="fs-explicit">Explicit
+                    <select id="fs-explicit">
+                        <option value="">Default (No)</option>
+                        <option value="no">No</option>
+                        <option value="yes">Yes</option>
+                        <option value="clean">Clean</option>
+                    </select>
+                </label>
+                <button class="btn btn-primary" type="submit">Save</button>
+            </form>
+        </div>
+    </div>
+
     <!-- Settings / About dialog -->
     <div id="settings-modal" class="modal" hidden>
         <div class="modal-backdrop" data-close></div>
@@ -663,6 +752,18 @@ _PAGE = """<!DOCTYPE html>
     <script src="/static/app.js"></script>
 </body>
 </html>"""
+
+
+# The category <select> is rendered from ITUNES_CATEGORIES at import time rather
+# than hand-written into the template, so the dropdown can never offer a value
+# that /channels/feed-settings would reject as unknown.
+_PAGE = _PAGE.replace(
+    "__ITUNES_CATEGORY_OPTIONS__",
+    '<option value="">Default (Technology)</option>'
+    # Escaped because a couple of the categories contain "&" ("Health & Fitness").
+    + "".join(f'<option value="{html.escape(c)}">{html.escape(c)}</option>'
+              for c in ITUNES_CATEGORIES),
+)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -712,6 +813,15 @@ def api_state():
             "thumbnail": _thumb_url(cid) if cid else None,
             "added_at": ch["added_at"],
             "last_poll": _last_poll(cid),
+            # Pre-fill values for the feed-settings modal. NULL means "default",
+            # which the modal renders as its blank/default option. Note this
+            # dict is built field by field on purpose — never serialize the raw
+            # row, which would leak feed_token into the response body.
+            "feed_settings": {
+                "category": ch["itunes_category"],
+                "language": ch["itunes_language"],
+                "explicit": ch["itunes_explicit"],
+            },
         })
 
     unsubscribed = []
@@ -742,6 +852,7 @@ def api_state():
         "next_poll": _next_poll_label(),
         "polling": _polling_state(),
         "jobs": jobs.snapshot(),
+        "all_feed_url": _all_feed_url(),
         "version": VERSION,
     })
 
@@ -805,6 +916,37 @@ def download_episode(url: str = Form(...), subscribe: bool = Form(False)):
         raise HTTPException(status_code=400, detail="Enter a valid http(s) video URL")
     threading.Thread(target=_run_download, args=[url, subscribe], daemon=True).start()
     return _ok("Download started — this can take a minute")
+
+
+@app.post("/episodes/delete")
+def delete_episode_endpoint(episode_id: str = Form(...)):
+    """Remove one episode's files and row — the fix for a single bad download."""
+    ep = db.get_episode(episode_id)
+    if not ep:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    delete_episode_files(ep["channel_id"], ep["filename"], ep["thumbnail"])
+    db.delete_episode(episode_id)
+    # Deliberately no skip_videos row. A prune or a members-only failure records
+    # one so the video never comes back; an explicit user delete is different —
+    # it should be re-downloadable on the next poll (or by the button below).
+    return _ok("Episode deleted")
+
+
+@app.post("/episodes/redownload")
+def redownload_episode_endpoint(episode_id: str = Form(...)):
+    """Force a fresh download of one episode (works whether or not the file is
+    still on disk — 'delete, then re-download' is the same code path)."""
+    ep = db.get_episode(episode_id)
+    if not ep:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    # episodes.id IS the YouTube video id (see downloader._download_entry's
+    # returned row), so no extra lookup is needed to find the video.
+    threading.Thread(
+        target=_run_redownload,
+        args=[ep["id"], ep["channel_id"], ep["channel_name"], ep["title"]],
+        daemon=True,
+    ).start()
+    return _ok("Re-downloading episode — this can take a minute")
 
 
 @app.get("/add")
@@ -920,6 +1062,33 @@ async def remove_channels_bulk(request: Request):
     return _ok(f"Removed {len(urls)} channel(s)")
 
 
+@app.post("/channels/feed-settings")
+def set_feed_settings(channel_id: str = Form(...), category: str = Form(""),
+                      language: str = Form(""), explicit: str = Form("")):
+    """Store this channel's iTunes category/language/explicit overrides.
+
+    An empty string means "use the default" and stores NULL, so the form can
+    clear a value it previously set. Everything is validated here because
+    feedgen validates almost none of it: itunes_category() and language() accept
+    any string and emit it verbatim, and itunes_explicit() raises ValueError —
+    which, on a public feed endpoint, would be a 500 rather than a bad feed.
+    """
+    if not _CHANNEL_ID_RE.match(channel_id):
+        raise HTTPException(status_code=400, detail="Invalid channel ID")
+    category, language, explicit = category.strip(), language.strip(), explicit.strip()
+    if category and category not in ITUNES_CATEGORIES:
+        raise HTTPException(status_code=400, detail="Unknown iTunes category")
+    if explicit and explicit not in _EXPLICIT_VALUES:
+        raise HTTPException(status_code=400, detail="Explicit must be yes, no, or clean")
+    if language and not _LANGUAGE_RE.match(language):
+        raise HTTPException(status_code=400, detail="Language must look like 'en' or 'en-US'")
+    if not db.get_channel_meta(channel_id):
+        raise HTTPException(status_code=404, detail="Channel not found")
+    db.set_channel_feed_settings(channel_id, category or None, language or None,
+                                 explicit or None)
+    return _ok("Feed settings saved")
+
+
 @app.post("/channels/poll")
 def poll_now(url: str = Form(...)):
     threading.Thread(target=_run_poll, args=[url], daemon=True).start()
@@ -986,8 +1155,35 @@ def test_email():
 # Feed endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/feed/all.xml", response_class=Response)
+def get_combined_feed(token: str | None = None):
+    """Every subscribed channel merged into one feed, newest first.
+
+    Registered BEFORE /feed/{channel_id}.xml on purpose. Starlette matches
+    routes in registration order with no literal-over-parameter preference, so
+    with these two swapped the parameterised route would swallow this one with
+    channel_id="all" and return a perfectly plausible "channel not found" —
+    a silent failure that looks like a bug in the feed builder. There's a test
+    asserting the registration order; keep it.
+    """
+    if not _token_ok(db.get_or_create_all_feed_token(), token):
+        raise HTTPException(status_code=404, detail="Not found")
+    rss = build_combined_feed()
+    if not rss:
+        raise HTTPException(status_code=404, detail="No episodes yet")
+    return Response(content=rss, media_type="application/rss+xml")
+
+
 @app.get("/feed/{channel_id}.xml", response_class=Response)
-def get_feed(channel_id: str):
+def get_feed(channel_id: str, token: str | None = None):
+    if not _CHANNEL_ID_RE.match(channel_id):
+        raise HTTPException(status_code=404, detail="Channel not found")
+    # 404 rather than 401/403 on a bad or missing token: an unauthenticated
+    # caller must not be able to tell "wrong token" from "no such channel".
+    # Read-only lookup — a feed fetch must never write; init_db()'s backfill and
+    # _feed_url()'s get-or-create are what guarantee the token exists.
+    if not _token_ok(db.get_feed_token(channel_id), token):
+        raise HTTPException(status_code=404, detail="Channel not found or no episodes yet")
     rss = build_feed(channel_id)
     if not rss:
         raise HTTPException(status_code=404, detail="Channel not found or no episodes yet")

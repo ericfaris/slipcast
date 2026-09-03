@@ -56,6 +56,15 @@ services:
       # Max channels polled at once by "poll all"/"poll selected"
       - POLL_CONCURRENCY=2
 
+      # Require ?token=<feed_token> on every feed request. Off by default so
+      # feeds already subscribed in a podcast app keep working; the token is
+      # embedded in every URL the dashboard hands out either way, so turning
+      # this on later doesn't invalidate URLs you already copied.
+      - REQUIRE_FEED_TOKENS=false
+
+      # Max items in the combined /feed/all.xml (all subscribed channels merged)
+      - ALL_FEED_MAX_EPISODES=100
+
       # Audio codec/bitrate for new downloads. "opus" is roughly half the size
       # of mp3 at equivalent quality but isn't universally supported by podcast
       # apps (notably Apple Podcasts, Pocket Casts) — check before switching.

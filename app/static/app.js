@@ -34,6 +34,8 @@ const state = {
   sort: 'added',
   seenJobs: new Set(),     // job ids already toasted
   primed: false,           // suppress toasts for jobs that existed at first load
+  epChannel: null,         // channel whose episode modal is open (for re-render)
+  fsChannel: null,         // channel whose feed-settings modal is open
 };
 
 /* ---- toasts ---- */
@@ -166,8 +168,14 @@ function subscribedCard(ch) {
   const share = el('button', { class: 'btn btn-ghost btn-sm', type: 'button', text: 'Share', onclick: () => openShare(ch) });
   if (!ch.feed_url) { share.disabled = true; share.title = 'Feed appears after the first successful poll'; }
 
+  // Same gate as Share: the settings are keyed by channel_id, which only exists
+  // once the channel has been polled successfully at least once.
+  const settings = el('button', { class: 'btn btn-ghost btn-sm', type: 'button', text: 'Feed settings', onclick: () => openFeedSettings(ch) });
+  if (!ch.channel_id) { settings.disabled = true; settings.title = 'Available after the first successful poll'; }
+
   card.appendChild(el('div', { class: 'ch-actions' }, [
     share,
+    settings,
     el('button', { class: 'btn btn-ghost btn-sm', type: 'button', text: 'Poll', onclick: () => act(() => postForm('/channels/poll', fd({ url: ch.url }))) }),
     el('button', {
       class: 'btn btn-danger-ghost btn-sm', type: 'button', text: 'Remove',
@@ -249,6 +257,7 @@ function render() {
   $('#subs-count').textContent = d.channels.length;
   $('#subs-storage').textContent = d.total_bytes ? `${fmtBytes(d.total_bytes)} on disk` : '';
   $('#oneoff-count').textContent = d.unsubscribed.length;
+  $('#all-feed-share').hidden = !(d.all_feed_url && d.channels.length);
   renderPolling(d);
 
   // activity indicator
@@ -445,10 +454,29 @@ function episodeRow(ep) {
     el('div', { class: 'ep-row-meta', text: meta }),
   ]));
   children.push(playWrap);
+  children.push(el('div', { class: 'ep-actions' }, [
+    el('button', {
+      class: 'btn btn-ghost btn-sm', type: 'button', text: 'Re-download',
+      title: 'Fetch this episode again, replacing the file on disk',
+      onclick: () => act(() => postForm('/episodes/redownload', fd({ episode_id: ep.id }))).then(refreshEpisodes),
+    }),
+    el('button', {
+      class: 'btn btn-danger-ghost btn-sm', type: 'button', text: 'Delete',
+      onclick: () => {
+        if (confirm(`Delete "${ep.title}"? The audio file will be removed.`)) {
+          act(() => postForm('/episodes/delete', fd({ episode_id: ep.id }))).then(refreshEpisodes);
+        }
+      },
+    }),
+  ]));
   return el('div', { class: 'ep-row' }, children);
 }
 
 async function openEpisodes(ch) {
+  // Remembered so an episode action can re-render the open modal: act() calls
+  // loadState(), which refreshes the dashboard's counts but knows nothing about
+  // the episode list, so a deleted row would otherwise linger on screen.
+  state.epChannel = ch;
   $('#ep-title').textContent = ch.name;
   $('#ep-sub').textContent = `${ch.episodes} episode${ch.episodes === 1 ? '' : 's'} being served · newest first`;
   const list = $('#ep-list');
@@ -466,10 +494,45 @@ async function openEpisodes(ch) {
   }
 }
 
+/* Re-fetch and re-render the open episode modal after a delete/re-download. */
+async function refreshEpisodes() {
+  if (state.epChannel && !$('#ep-modal').hidden) await openEpisodes(state.epChannel);
+}
+
 function closeEpisodes() {
   const m = $('#ep-modal');
   m.hidden = true;
+  state.epChannel = null;
   $('#ep-list').replaceChildren();  // stop any inline audio playback
+}
+
+/* ---- feed settings modal ---- */
+function openFeedSettings(ch) {
+  if (!ch.channel_id) return;
+  state.fsChannel = ch;
+  const fs = ch.feed_settings || {};
+  $('#fs-name').textContent = ch.name;
+  $('#fs-category').value = fs.category || '';
+  $('#fs-language').value = fs.language || '';
+  $('#fs-explicit').value = fs.explicit || '';
+  $('#fs-modal').hidden = false;
+  $('#fs-category').focus();
+}
+
+function closeFeedSettings() { $('#fs-modal').hidden = true; state.fsChannel = null; }
+
+function submitFeedSettings() {
+  const ch = state.fsChannel;
+  if (!ch) return;
+  // Blank means "use the default" — the server stores NULL for it, which is how
+  // a previously-set value gets cleared.
+  const body = fd({
+    channel_id: ch.channel_id,
+    category: $('#fs-category').value,
+    language: $('#fs-language').value.trim(),
+    explicit: $('#fs-explicit').value,
+  });
+  act(() => postForm('/channels/feed-settings', body)).then(closeFeedSettings);
 }
 
 /* ---- settings / about modal ---- */
@@ -644,14 +707,24 @@ function init() {
   $('#share-copy').addEventListener('click', (e) => copyText($('#share-url-input').value, e.target));
   $$('#share-modal [data-close]').forEach((n) => n.addEventListener('click', closeShare));
 
+  // all-channels combined feed — reuses the share modal, which only reads
+  // .name and .feed_url.
+  $('#all-feed-share').addEventListener('click', () => {
+    if (state.data?.all_feed_url) openShare({ name: 'All channels', feed_url: state.data.all_feed_url });
+  });
+
   // episodes modal
   $$('#ep-modal [data-close]').forEach((n) => n.addEventListener('click', closeEpisodes));
+
+  // feed settings modal
+  $$('#fs-modal [data-close]').forEach((n) => n.addEventListener('click', closeFeedSettings));
+  $('#fs-form').addEventListener('submit', (e) => { e.preventDefault(); submitFeedSettings(); });
 
   // settings / about modal
   $('#settings-btn').addEventListener('click', openSettings);
   $$('#settings-modal [data-close]').forEach((n) => n.addEventListener('click', closeSettings));
 
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeShare(); closeEpisodes(); closeSettings(); } });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeShare(); closeEpisodes(); closeSettings(); closeFeedSettings(); } });
 
   loadState();
 }

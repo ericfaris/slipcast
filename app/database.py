@@ -78,6 +78,38 @@ def init_db():
         cols = {r[1] for r in conn.execute("PRAGMA table_info(episodes)").fetchall()}
         if "thumbnail" not in cols:
             conn.execute("ALTER TABLE episodes ADD COLUMN thumbnail TEXT")
+        # Feed access tokens + per-channel iTunes metadata overrides. Every new
+        # column is nullable, so an older DB keeps working untouched until
+        # something writes to one; NULL means "use the built-in default" for the
+        # itunes_* columns (see app/feed.py).
+        ch_cols = {r[1] for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
+        for col in ("feed_token", "itunes_category", "itunes_language", "itunes_explicit"):
+            if col not in ch_cols:
+                conn.execute(f"ALTER TABLE channels ADD COLUMN {col} TEXT")
+        un_cols = {r[1] for r in conn.execute("PRAGMA table_info(unsubscribed_channels)").fetchall()}
+        if "feed_token" not in un_cols:
+            conn.execute("ALTER TABLE unsubscribed_channels ADD COLUMN feed_token TEXT")
+        # Install-wide key/value settings. First (and so far only) user: the
+        # combined feed's access token, which belongs to no single channel.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        # One-time backfill so every existing row has a token the moment this
+        # ships — turning REQUIRE_FEED_TOKENS on later then needs no second
+        # migration. The WHERE feed_token IS NULL guard is what makes init_db()
+        # (which runs on EVERY startup) idempotent: rotating a token here would
+        # silently break every already-subscribed podcast app. Each row needs
+        # its own secret, so this is a per-row loop rather than one UPDATE.
+        for row in conn.execute("SELECT url FROM channels WHERE feed_token IS NULL").fetchall():
+            conn.execute("UPDATE channels SET feed_token = ? WHERE url = ?",
+                         (secrets.token_urlsafe(24), row["url"]))
+        for row in conn.execute(
+                "SELECT channel_id FROM unsubscribed_channels WHERE feed_token IS NULL").fetchall():
+            conn.execute("UPDATE unsubscribed_channels SET feed_token = ? WHERE channel_id = ?",
+                         (secrets.token_urlsafe(24), row["channel_id"]))
 
 
 @contextmanager
@@ -118,6 +150,29 @@ def get_episodes(channel_id: str) -> list[sqlite3.Row]:
             WHERE channel_id = ?
             ORDER BY published DESC
         """, (channel_id,)).fetchall()
+
+
+def get_episode(episode_id: str) -> sqlite3.Row | None:
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone()
+
+
+def get_combined_episodes(limit: int) -> list[sqlite3.Row]:
+    """Newest-first episodes across all *subscribed* channels, for /feed/all.xml.
+
+    A subquery rather than a JOIN on channels: two channels rows can legitimately
+    share one channel_id (URL variants for the same channel — see
+    main._resolve_channel_id_for_removal), and a JOIN would then emit that
+    channel's episodes twice, producing duplicate items in the combined feed.
+    """
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT * FROM episodes
+            WHERE channel_id IN
+                (SELECT channel_id FROM channels WHERE channel_id IS NOT NULL)
+            ORDER BY published DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
 
 
 def get_all_episodes_oldest_first() -> list[sqlite3.Row]:
@@ -264,6 +319,124 @@ def delete_episodes_for_channel(channel_id: str) -> list:
         ).fetchall()
         conn.execute("DELETE FROM episodes WHERE channel_id = ?", (channel_id,))
     return rows
+
+
+# --- feed access tokens -----------------------------------------------------
+
+# Key in the settings table holding the combined feed's token. It belongs to no
+# single channel, so it can't live in either channels table.
+_ALL_FEED_TOKEN_KEY = "all_feed_token"
+
+
+def get_feed_token(channel_id: str) -> str | None:
+    """The stored token for a channel_id, or None if no row owns it.
+
+    Read-only on purpose: this is the request path (a feed fetch must not
+    write). init_db()'s backfill and main._feed_url()'s get-or-create are what
+    guarantee a token exists by the time anyone fetches a feed.
+    """
+    with get_conn() as conn:
+        return _select_feed_token(conn, channel_id)
+
+
+def _select_feed_token(conn, channel_id: str) -> str | None:
+    """channels first, then unsubscribed_channels — the feed route serves both."""
+    row = conn.execute(
+        "SELECT feed_token FROM channels WHERE channel_id = ? AND feed_token IS NOT NULL",
+        (channel_id,),
+    ).fetchone()
+    if row:
+        return row["feed_token"]
+    row = conn.execute(
+        "SELECT feed_token FROM unsubscribed_channels WHERE channel_id = ?", (channel_id,)
+    ).fetchone()
+    return row["feed_token"] if row else None
+
+
+def get_or_create_feed_token(channel_id: str) -> str | None:
+    """Token for a channel_id, generating one if the owning row has none yet.
+
+    Covers what the init_db() backfill can't: a channels row whose channel_id
+    was still NULL at migration time (it's only populated by update_channel_meta
+    after the first successful poll), and rows added afterwards. Returns None
+    when no row owns that channel_id at all.
+
+    The `AND feed_token IS NULL` guard plus the re-read makes two racing callers
+    converge on one token rather than the second clobbering (and invalidating)
+    the first — writers serialize under WAL + busy_timeout.
+    """
+    with get_conn() as conn:
+        existing = _select_feed_token(conn, channel_id)
+        if existing:
+            return existing
+        token = secrets.token_urlsafe(24)
+        conn.execute(
+            "UPDATE channels SET feed_token = ? WHERE channel_id = ? AND feed_token IS NULL",
+            (token, channel_id),
+        )
+        conn.execute(
+            "UPDATE unsubscribed_channels SET feed_token = ? "
+            "WHERE channel_id = ? AND feed_token IS NULL",
+            (token, channel_id),
+        )
+        return _select_feed_token(conn, channel_id)
+
+
+def get_setting(key: str) -> str | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
+        )
+
+
+def get_or_create_all_feed_token() -> str:
+    """Token for the combined /feed/all.xml, created on first access.
+
+    INSERT OR IGNORE then re-SELECT (rather than INSERT OR REPLACE) so two
+    racing callers can't end up handing out two different values, one of which
+    is already dead.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            (_ALL_FEED_TOKEN_KEY, secrets.token_urlsafe(24)),
+        )
+        return conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (_ALL_FEED_TOKEN_KEY,)
+        ).fetchone()["value"]
+
+
+# --- per-channel feed metadata ----------------------------------------------
+
+def get_channel_feed_settings(channel_id: str) -> sqlite3.Row | None:
+    """The three iTunes overrides for a subscribed channel, or None.
+
+    None (an unsubscribed or unknown channel_id) is what makes app/feed.py fall
+    back to the built-in defaults — one-off feeds deliberately have no overrides.
+    """
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT itunes_category, itunes_language, itunes_explicit "
+            "FROM channels WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+
+
+def set_channel_feed_settings(channel_id: str, category: str | None,
+                              language: str | None, explicit: str | None) -> None:
+    """Store (or, with None, clear back to the default) a channel's overrides."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE channels SET itunes_category = ?, itunes_language = ?, "
+            "itunes_explicit = ? WHERE channel_id = ?",
+            (category, language, explicit, channel_id),
+        )
 
 
 # --- poll history -----------------------------------------------------------

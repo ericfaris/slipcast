@@ -13,6 +13,7 @@ import yt_dlp
 
 from app import database as db
 from app import notify
+from app.safety import is_safe_media_name
 from app.config import (
     AUDIO_BITRATE_KBPS,
     AUDIO_CODEC,
@@ -381,6 +382,20 @@ def _fetch_channel_entries(channel_url: str, max_entries: int) -> tuple[list[dic
     return entries, channel_id, channel_name
 
 
+def _audio_path_candidates(channel_id: str, video_id: str) -> list[str]:
+    """Every path one video's audio could occupy, current codec first.
+
+    An episode downloaded before AUDIO_CODEC changed still lives under its
+    original extension, so both the "already have it" check and an explicit
+    re-download have to consider all of them — otherwise flipping the codec
+    makes every existing episode look missing, and a re-download leaves the old
+    file behind to be found by the next poll's existence check.
+    """
+    audio_dir = _audio_dir_for(channel_id)
+    exts = [_audio_ext()] + [e for e in _KNOWN_AUDIO_EXTENSIONS if e != _audio_ext()]
+    return [os.path.join(audio_dir, f"{video_id}.{e}") for e in exts]
+
+
 def _download_entry(entry: dict, channel_id: str, channel_name: str, *,
                     enforce_duration: bool = True) -> dict | None:
     video_id = entry.get("id")
@@ -390,16 +405,11 @@ def _download_entry(entry: dict, channel_id: str, channel_name: str, *,
         logger.warning("Skipping entry with suspicious video_id: %r", video_id)
         return None
 
-    audio_dir = _audio_dir_for(channel_id)
-    expected_file = os.path.join(audio_dir, f"{video_id}.{_audio_ext()}")
-    # An episode downloaded before AUDIO_CODEC changed still lives under its
-    # original extension; treat any of them as "already have it" so flipping the
-    # codec doesn't re-download an entire library.
-    existing = next(
-        (p for p in (os.path.join(audio_dir, f"{video_id}.{e}") for e in _KNOWN_AUDIO_EXTENSIONS)
-         if os.path.exists(p)),
-        None,
-    )
+    candidates = _audio_path_candidates(channel_id, video_id)
+    expected_file = candidates[0]  # current codec — what this download will write
+    # Treat a file under any known extension as "already have it" so flipping
+    # the codec doesn't re-download an entire library.
+    existing = next((p for p in candidates if os.path.exists(p)), None)
     if existing:
         logger.debug("Already downloaded: %s", video_id)
         return None
@@ -949,6 +959,60 @@ def remove_channel_data(channel_id: str):
         if os.path.exists(path):
             shutil.rmtree(path)
             logger.info("Removed directory: %s", path)
+
+
+def delete_episode_files(channel_id: str, filename: str | None,
+                         thumbnail: str | None = None) -> None:
+    """Remove one episode's audio and thumbnail from disk.
+
+    The DB row is the caller's business (see main.delete_episode_endpoint) —
+    this is only the on-disk half, guarded by the same safe-name checks the
+    feed and episode API use, so a hand-edited row can't turn a delete into a
+    path traversal.
+    """
+    if not _CHANNEL_ID_RE.match(channel_id or ""):
+        logger.error("Refusing to delete files for suspicious channel_id: %r", channel_id)
+        return
+    if is_safe_media_name(filename):
+        _remove_if_exists(os.path.join(_audio_dir_for(channel_id), filename))
+    elif filename:
+        logger.warning("Refusing to delete unsafe audio filename for %s: %r",
+                       channel_id, filename)
+    if is_safe_media_name(thumbnail):
+        _remove_if_exists(os.path.join(_thumbnail_dir_for(channel_id), thumbnail))
+
+
+def redownload_episode(video_id: str, channel_id: str, channel_name: str) -> dict | None:
+    """Force a fresh download of one video, ignoring the "already on disk" check.
+
+    _download_entry() short-circuits on an existing file so a normal poll doesn't
+    redo work it has already done. An explicit user re-download — the fix for a
+    truncated or corrupt file — has to override that, so every candidate file is
+    removed first. Removing them also makes this the same code path whether the
+    episode still exists or was just deleted from the dashboard, which is the
+    main use case ("delete, then re-download").
+
+    Returns the episode row to upsert, or None if the download didn't produce one.
+    """
+    if not _VIDEO_ID_RE.match(video_id or ""):
+        logger.warning("Refusing to re-download suspicious video_id: %r", video_id)
+        return None
+    if not _CHANNEL_ID_RE.match(channel_id or ""):
+        logger.warning("Refusing to re-download for suspicious channel_id: %r", channel_id)
+        return None
+
+    for path in _audio_path_candidates(channel_id, video_id):
+        _remove_if_exists(path)
+    try:
+        # enforce_duration stays on: re-downloading is not a way to smuggle an
+        # over-cap video past MAX_EPISODE_DURATION_MINUTES.
+        return _download_entry({"id": video_id}, channel_id, channel_name)
+    except MemberOnlyError:
+        logger.warning("Cannot re-download %s — members-only video", video_id)
+        return None
+    except TooLongError:
+        logger.warning("Cannot re-download %s — exceeds the duration cap", video_id)
+        return None
 
 
 def _dir_bytes(path: str) -> int:
