@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -16,7 +17,9 @@ from app.config import (
     AUDIO_DIR,
     COOKIE_EXPIRY_WARN_DAYS,
     COOKIES_FILE,
+    DATA_DIR,
     MAX_EPISODES_PER_CHANNEL,
+    MIN_FREE_DISK_GB,
     THUMBNAIL_DIR,
 )
 
@@ -31,6 +34,18 @@ _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 # resolve to these, so attacker-influenced metadata can't point urlretrieve at
 # an internal address (SSRF) or a local file (file://).
 _ALLOWED_THUMBNAIL_HOST_SUFFIXES = (".ytimg.com", ".ggpht.com", ".googleusercontent.com")
+
+# Both of these bound _download_thumbnail's two network/subprocess waits, for
+# the same reason _base_ydl_opts() sets socket_timeout: neither urllib nor
+# subprocess.run applies a timeout by default, so a thumbnail host that accepts
+# the connection and then never sends a byte — or an ffmpeg that wedges — hangs
+# the poll thread forever. Because APScheduler runs poll_all with
+# max_instances=1, one hung run silently blocks every future scheduled poll
+# with no error and no log: exactly the v1.10.0 multi-week outage, reached by a
+# different path. A thumbnail is cosmetic, so timing one out and moving on is
+# always the right trade.
+_THUMBNAIL_FETCH_TIMEOUT = 30
+_FFMPEG_TIMEOUT = 60
 
 
 def _allowed_thumbnail_url(url: str) -> bool:
@@ -97,10 +112,17 @@ def _download_thumbnail(url: str, dest: str) -> bool:
         return False
     tmp = dest + ".tmp"
     try:
-        urllib.request.urlretrieve(url, tmp)
+        # urlretrieve() takes no timeout at all, so it can't be used here.
+        # urlopen's timeout bounds each individual socket operation rather than
+        # total wall time — the same guarantee yt-dlp's socket_timeout gives,
+        # and enough to stop a silently stalled peer from pinning the thread.
+        with urllib.request.urlopen(url, timeout=_THUMBNAIL_FETCH_TIMEOUT) as resp, \
+                open(tmp, "wb") as out:
+            shutil.copyfileobj(resp, out)
         result = subprocess.run(
             ["ffmpeg", "-y", "-i", tmp, dest],
             capture_output=True,
+            timeout=_FFMPEG_TIMEOUT,
         )
         if result.returncode != 0:
             logger.warning("ffmpeg thumbnail conversion failed for %s: %s", url, result.stderr.decode())
@@ -639,7 +661,101 @@ def _record_run(url, channel_id, started_at, *, status, downloaded=0,
         logger.exception("Failed to record poll run for %s", url)
 
 
+def _free_disk_gb(path: str) -> float:
+    return shutil.disk_usage(path).free / (1024 ** 3)
+
+
+def _enforce_disk_floor() -> None:
+    """Delete the globally oldest episodes until free disk clears the floor.
+
+    MAX_EPISODES_PER_CHANNEL caps each channel on its own, but nothing caps the
+    total: enough channels, or long enough episodes, and the volume fills. A
+    full disk doesn't produce a clean error — yt-dlp fails mid-write, SQLite
+    starts refusing writes, and the failure looks like something else entirely.
+    So we free space *before* downloading rather than discovering it partway
+    through, and we do it globally oldest-first (not per channel) because the
+    thing that ran out is one shared filesystem.
+
+    This deletes the user's downloads irreversibly, so it always emails.
+    """
+    if MIN_FREE_DISK_GB <= 0:
+        return  # explicit opt-out
+
+    free = _free_disk_gb(DATA_DIR)
+    if free >= MIN_FREE_DISK_GB:
+        return
+
+    logger.warning(
+        "Free disk %.2f GB is below MIN_FREE_DISK_GB=%d — pruning oldest episodes",
+        free, MIN_FREE_DISK_GB,
+    )
+
+    pruned: list[str] = []
+    freed_bytes = 0
+    for ep in db.get_all_episodes_oldest_first():
+        channel_id = ep["channel_id"]
+        try:
+            # _audio_dir_for/_thumbnail_dir_for raise on a channel_id that
+            # doesn't match the safe-name regex. That row's files can't be
+            # located safely, but the row itself should still go — otherwise
+            # it's an undeletable blocker at the head of the oldest-first list.
+            if _CHANNEL_ID_RE.match(channel_id):
+                _remove_if_exists(os.path.join(_audio_dir_for(channel_id), ep["filename"]))
+                if ep["thumbnail"]:
+                    _remove_if_exists(
+                        os.path.join(_thumbnail_dir_for(channel_id), ep["thumbnail"])
+                    )
+            else:
+                logger.warning(
+                    "Disk prune: not touching files for suspicious channel_id %r "
+                    "(dropping the row only)", channel_id,
+                )
+            db.delete_episode(ep["id"])
+            # Same reasoning as _prune_channel(): without a skip marker the very
+            # next poll re-downloads exactly what we just deleted and refills
+            # the disk, and the two fight each other forever.
+            db.add_skip_video(ep["id"], channel_id, "disk_pressure")
+        except Exception:  # noqa: BLE001 — one bad row (permissions, a file
+            # already gone) must not abort the rest of the remediation.
+            logger.exception("Disk prune failed for episode %s", ep["id"])
+            continue
+
+        freed_bytes += ep["filesize"] or 0
+        pruned.append(f'{ep["channel_name"]} — {ep["title"]}')
+
+        # Re-stat after every single deletion rather than guessing a batch
+        # size: one episode can be hundreds of MB, and this stops the moment
+        # we're back above the floor, deleting the minimum necessary.
+        free = _free_disk_gb(DATA_DIR)
+        if free >= MIN_FREE_DISK_GB:
+            break
+
+    if pruned:
+        logger.warning("Disk prune removed %d episode(s), freed %.0f MB, now %.2f GB free",
+                       len(pruned), freed_bytes / 1_048_576, free)
+        notify.send_disk_prune_alert(pruned, freed_bytes, free)
+
+    if free < MIN_FREE_DISK_GB:
+        logger.error(
+            "Free disk still %.2f GB after pruning everything available "
+            "(threshold %d GB) — something other than episodes is using the volume",
+            free, MIN_FREE_DISK_GB,
+        )
+        if not pruned:
+            # send_disk_prune_alert([]) is a no-op by design, but "the disk is
+            # full and I have nothing left to delete" is the single most
+            # important thing to tell a human about, so synthesize a line.
+            notify.send_disk_prune_alert(["(nothing left to prune)"], 0, free)
+
+
 def poll_all():
+    # Relieve disk pressure before anything downloads, so a full volume is
+    # fixed up front rather than hit halfway through a write.
+    try:
+        _enforce_disk_floor()
+    except Exception:  # noqa: BLE001 — remediation must never abort the poll run
+        logger.exception("Disk-pressure check failed")
+
     if not valid_cookie_file(COOKIES_FILE):
         logger.warning("Cookies file missing/invalid at poll time — alerting")
         notify.send_cookie_alert()

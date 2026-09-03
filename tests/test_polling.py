@@ -518,3 +518,266 @@ class _FakeYDL:
 
     def extract_info(self, *a, **k):
         return self._info
+
+
+# --- thumbnail download can't hang forever -----------------------------------
+
+def test_thumbnail_fetch_timeout_degrades_gracefully(tmp_path, monkeypatch):
+    """A stalled thumbnail host must not pin the poll thread (v1.10.0 class)."""
+    def _timeout(*a, **k):
+        raise TimeoutError("the read timed out")
+
+    monkeypatch.setattr(downloader.urllib.request, "urlopen", _timeout)
+    dest = str(tmp_path / "thumb.jpg")
+
+    assert downloader._download_thumbnail(
+        "https://i.ytimg.com/vi/abc/hq.jpg", dest) is False
+    assert not os.path.exists(dest)
+    assert not os.path.exists(dest + ".tmp")  # temp file cleaned up
+
+
+def test_thumbnail_ffmpeg_timeout_degrades_gracefully(tmp_path, monkeypatch):
+    import io
+    import subprocess
+
+    class _Resp:
+        def __enter__(self):
+            return io.BytesIO(b"\xff\xd8jpegbytes")
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(downloader.urllib.request, "urlopen",
+                        lambda *a, **k: _Resp())
+
+    def _hang(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=60)
+
+    monkeypatch.setattr(downloader.subprocess, "run", _hang)
+    dest = str(tmp_path / "thumb.jpg")
+
+    assert downloader._download_thumbnail(
+        "https://i.ytimg.com/vi/abc/hq.jpg", dest) is False
+    assert not os.path.exists(dest + ".tmp")
+
+
+def test_thumbnail_calls_pass_timeouts(tmp_path, monkeypatch):
+    """Both blocking calls must actually receive a bounded timeout."""
+    import io
+
+    seen = {}
+
+    class _Resp:
+        def __enter__(self):
+            return io.BytesIO(b"jpegbytes")
+
+        def __exit__(self, *a):
+            return False
+
+    def _urlopen(url, timeout=None, **k):
+        seen["fetch"] = timeout
+        return _Resp()
+
+    class _Done:
+        returncode = 0
+        stderr = b""
+
+    def _run(cmd, **kwargs):
+        seen["ffmpeg"] = kwargs.get("timeout")
+        open(cmd[-1], "wb").write(b"jpeg")
+        return _Done()
+
+    monkeypatch.setattr(downloader.urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(downloader.subprocess, "run", _run)
+
+    downloader._download_thumbnail("https://i.ytimg.com/vi/abc/hq.jpg",
+                                   str(tmp_path / "t.jpg"))
+
+    assert seen["fetch"] == downloader._THUMBNAIL_FETCH_TIMEOUT > 0
+    assert seen["ffmpeg"] == downloader._FFMPEG_TIMEOUT > 0
+
+
+# --- disk-pressure auto-prune -------------------------------------------------
+
+CID2 = "UCdef12345678901234567890"
+
+
+def _seed_episode_with_files(ep):
+    """Insert an episode row and create its audio + thumbnail files on disk."""
+    db.upsert_episode(ep)
+    audio = os.path.join(downloader._audio_dir_for(ep["channel_id"]), ep["filename"])
+    open(audio, "wb").write(b"a" * 16)
+    thumb = None
+    if ep["thumbnail"]:
+        thumb = os.path.join(downloader._thumbnail_dir_for(ep["channel_id"]), ep["thumbnail"])
+        open(thumb, "wb").write(b"t")
+    return audio, thumb
+
+
+def _fake_disk(monkeypatch, free_gbs):
+    """shutil.disk_usage stub returning each value in free_gbs, then the last."""
+    import collections
+    Usage = collections.namedtuple("Usage", "total used free")
+    seq = list(free_gbs)
+
+    def _usage(path):
+        gb = seq.pop(0) if len(seq) > 1 else seq[0]
+        return Usage(100 * 1024 ** 3, 0, int(gb * 1024 ** 3))
+
+    monkeypatch.setattr(downloader.shutil, "disk_usage", _usage)
+
+
+def _capture_prune_alert(monkeypatch):
+    calls = []
+    monkeypatch.setattr(downloader.notify, "send_disk_prune_alert",
+                        lambda pruned, freed, free_gb, **kw: calls.append(
+                            (list(pruned), freed, free_gb)))
+    return calls
+
+
+def test_disk_floor_prunes_globally_oldest_across_channels(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 2)
+
+    files = {}
+    # Interleaved across two channels: v000 (CID2) and v001 (CID) are the two
+    # oldest overall, so a per-channel pruner would pick different victims.
+    for i, cid in ((0, CID2), (1, CID), (2, CID2), (3, CID)):
+        ep = _ep(i, cid)
+        ep["thumbnail"] = f"v{i:03d}.jpg"
+        ep["filesize"] = 1_048_576
+        files[ep["id"]] = _seed_episode_with_files(ep)
+
+    # Below the floor for the initial check and after the first deletion;
+    # clear once the two oldest are gone.
+    _fake_disk(monkeypatch, [0.5, 0.9, 3.0])
+    alerts = _capture_prune_alert(monkeypatch)
+
+    downloader._enforce_disk_floor()
+
+    remaining = {r["id"] for r in db.get_all_episodes_oldest_first()}
+    assert remaining == {"v002", "v003"}  # the two globally oldest went
+    for gone in ("v000", "v001"):
+        audio, thumb = files[gone]
+        assert not os.path.exists(audio)
+        assert not os.path.exists(thumb)
+    for kept in ("v002", "v003"):
+        assert os.path.exists(files[kept][0])
+
+    # Skip-marked, or the very next poll re-downloads them and refills the disk.
+    assert db.get_skip_video_ids(CID2) == {"v000"}
+    assert db.get_skip_video_ids(CID) == {"v001"}
+
+    assert len(alerts) == 1
+    pruned, freed, free_gb = alerts[0]
+    assert len(pruned) == 2 and any("t0" in p for p in pruned)
+    assert freed == 2 * 1_048_576
+    assert free_gb == 3.0
+
+
+def test_disk_floor_noop_when_space_is_plentiful(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 2)
+    for i in range(3):
+        _seed_episode_with_files(_ep(i))
+    _fake_disk(monkeypatch, [50.0])
+    alerts = _capture_prune_alert(monkeypatch)
+
+    downloader._enforce_disk_floor()
+
+    assert len(db.get_episodes(CID)) == 3
+    assert alerts == []
+    assert db.get_skip_video_ids(CID) == set()
+
+
+def test_disk_floor_disabled_by_zero_threshold(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 0)
+    _seed_episode_with_files(_ep(0))
+
+    def _boom(path):
+        raise AssertionError("disk must not even be checked when disabled")
+
+    monkeypatch.setattr(downloader.shutil, "disk_usage", _boom)
+    downloader._enforce_disk_floor()
+    assert len(db.get_episodes(CID)) == 1
+
+
+def test_disk_floor_alerts_when_nothing_left_to_prune(tmp_path, monkeypatch):
+    """Still-full after deleting everything is the loudest case, not a quiet one."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 2)
+    _fake_disk(monkeypatch, [0.1])  # never clears
+    alerts = _capture_prune_alert(monkeypatch)
+
+    downloader._enforce_disk_floor()  # no episodes exist at all
+
+    assert len(alerts) == 1
+    assert alerts[0][0] == ["(nothing left to prune)"]
+
+
+def test_disk_floor_continues_past_a_failed_deletion(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 2)
+    for i in range(3):
+        _seed_episode_with_files(_ep(i))
+
+    real_remove = downloader._remove_if_exists
+
+    def _flaky(path):
+        if path.endswith("v000.mp3"):
+            raise OSError("permission denied")
+        return real_remove(path)
+
+    monkeypatch.setattr(downloader, "_remove_if_exists", _flaky)
+    # 0.5 GB at the initial check; clear once one episode has actually gone.
+    _fake_disk(monkeypatch, [0.5, 3.0])
+    _capture_prune_alert(monkeypatch)
+
+    downloader._enforce_disk_floor()
+
+    # v000 failed and was left intact; the loop moved on and freed v001 instead.
+    assert {r["id"] for r in db.get_all_episodes_oldest_first()} == {"v000", "v002"}
+
+
+def test_poll_all_enforces_disk_floor_before_polling(tmp_path, monkeypatch):
+    """Space is freed up front, not discovered halfway through a download."""
+    _setup_tmp(tmp_path, monkeypatch)
+    order = []
+    monkeypatch.setattr(downloader, "_enforce_disk_floor",
+                        lambda: order.append("disk"))
+    monkeypatch.setattr(downloader, "valid_cookie_file", lambda p: True)
+    monkeypatch.setattr(downloader, "cookies_status",
+                        lambda: {"present": True, "expired": False,
+                                 "days_until_expiry": None})
+    monkeypatch.setattr(db, "get_channels",
+                        lambda: [{"url": "https://www.youtube.com/@A"}])
+    monkeypatch.setattr(downloader, "poll_channel",
+                        lambda url: order.append("poll") or None)
+
+    downloader.poll_all()
+
+    assert order == ["disk", "poll"]
+
+
+def test_poll_all_survives_a_failing_disk_check(tmp_path, monkeypatch):
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "_enforce_disk_floor",
+                        lambda: (_ for _ in ()).throw(RuntimeError("statvfs failed")))
+    monkeypatch.setattr(downloader, "valid_cookie_file", lambda p: True)
+    monkeypatch.setattr(downloader, "cookies_status",
+                        lambda: {"present": True, "expired": False,
+                                 "days_until_expiry": None})
+    polled = []
+    monkeypatch.setattr(db, "get_channels", lambda: [{"url": "https://x"}])
+    monkeypatch.setattr(downloader, "poll_channel",
+                        lambda url: polled.append(url) or None)
+
+    downloader.poll_all()  # remediation failing must never abort the run
+
+    assert polled == ["https://x"]

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Slipcast autoheal check every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=slipcast-autoheal.service
+
+[Install]
+WantedBy=timers.target

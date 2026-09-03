@@ -332,3 +332,125 @@ def send_poll_failure_alert(problems: list[str], force: bool = False) -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to send poll-failure alert email: %s", exc)
         return False
+
+
+def _disk_prune_message(pruned: list[str], freed_bytes: int, free_gb: float) -> EmailMessage:
+    ui_url = config.BASE_URL.rstrip("/") + "/"
+    msg = EmailMessage()
+    msg["Subject"] = f"⚠️ Slipcast: pruned {len(pruned)} episode(s) to free disk space"
+    msg["From"] = config.SMTP_FROM
+    msg["To"] = config.ALERT_EMAIL
+
+    # A very long list would make the email unreadable (and some clients
+    # truncate it anyway); the count in the subject already carries the scale.
+    shown = pruned[:20]
+    lines = "\n".join(f"  • {p}" for p in shown)
+    if len(pruned) > len(shown):
+        lines += f"\n  …and {len(pruned) - len(shown)} more"
+
+    msg.set_content(f"""\
+Slipcast — episodes were deleted to free disk space
+
+Free space on the data volume fell below the MIN_FREE_DISK_GB threshold
+({config.MIN_FREE_DISK_GB} GB), so Slipcast deleted the oldest episodes across
+all channels — audio, thumbnails, and database rows — until it was back above
+the line. This is real data loss, deliberate but irreversible, so you're being
+told about it.
+
+Freed:          {freed_bytes / 1_048_576:.0f} MB
+Free space now: {free_gb:.1f} GB
+Threshold:      {config.MIN_FREE_DISK_GB} GB
+
+Deleted:
+{lines}
+
+To stop this recurring, either give the volume more space or lower
+MAX_EPISODES_PER_CHANNEL so channels use less of it. Deleted episodes are
+skip-marked so the next poll doesn't immediately re-download them.
+
+Management UI:
+{ui_url}
+""")
+    return msg
+
+
+def send_disk_prune_alert(pruned: list[str], freed_bytes: int, free_gb: float,
+                          force: bool = False) -> bool:
+    """Email when the disk-pressure pruner deleted episodes to free space.
+
+    Auto-deleting a user's downloads is the most destructive thing Slipcast
+    does on its own, so it must never happen silently. Debounced under its own
+    key. Returns True if sent.
+    """
+    if not pruned:
+        return False
+    if not _smtp_configured():
+        logger.info("Disk-prune alert not sent: SMTP not configured")
+        return False
+
+    cooldown = config.ALERT_COOLDOWN_HOURS * 3600
+    if not force and (time.time() - _last_sent("disk_prune")) < cooldown:
+        logger.debug("Disk-prune alert suppressed (within %dh cooldown)",
+                     config.ALERT_COOLDOWN_HOURS)
+        return False
+
+    msg = _disk_prune_message(pruned, freed_bytes, free_gb)
+    try:
+        _send(msg)
+        _record_sent("disk_prune")
+        logger.info("Sent disk-prune alert to %s (%d episodes)",
+                    config.ALERT_EMAIL, len(pruned))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to send disk-prune alert email: %s", exc)
+        return False
+
+
+def _backup_failure_message(reason: str) -> EmailMessage:
+    msg = EmailMessage()
+    msg["Subject"] = "⚠️ Slipcast: database backup problem"
+    msg["From"] = config.SMTP_FROM
+    msg["To"] = config.ALERT_EMAIL
+
+    msg.set_content(f"""\
+Slipcast — the nightly database job reported a problem
+
+{reason}
+
+The database holds every channel subscription and episode record; the audio
+files on disk are useless without it. Snapshots are taken nightly into
+DATA_DIR/backups/ (the last 7 are kept), so if the live database is corrupt
+there is very likely a good one from last night to fall back on.
+
+Restore is deliberately manual — never automated against a condition that may
+still be corrupting writes. The step-by-step procedure is in README.md, under
+"Database backup and restore".
+""")
+    return msg
+
+
+def send_backup_failure_alert(reason: str, force: bool = False) -> bool:
+    """Email when the nightly backup job fails or PRAGMA integrity_check does.
+
+    Corruption detection only — restoring is a documented manual procedure.
+    Debounced under its own key. Returns True if sent.
+    """
+    if not _smtp_configured():
+        logger.info("Backup-failure alert not sent: SMTP not configured")
+        return False
+
+    cooldown = config.ALERT_COOLDOWN_HOURS * 3600
+    if not force and (time.time() - _last_sent("backup_failure")) < cooldown:
+        logger.debug("Backup-failure alert suppressed (within %dh cooldown)",
+                     config.ALERT_COOLDOWN_HOURS)
+        return False
+
+    msg = _backup_failure_message(reason)
+    try:
+        _send(msg)
+        _record_sent("backup_failure")
+        logger.info("Sent backup-failure alert to %s", config.ALERT_EMAIL)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to send backup-failure alert email: %s", exc)
+        return False

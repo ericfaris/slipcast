@@ -1,6 +1,14 @@
+import logging
+import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
-from app.config import DB_PATH
+from datetime import datetime, timezone
+
+from app import notify
+from app.config import BACKUP_DIR, DB_PATH
+
+logger = logging.getLogger(__name__)
 
 
 def init_db():
@@ -110,6 +118,17 @@ def get_episodes(channel_id: str) -> list[sqlite3.Row]:
             WHERE channel_id = ?
             ORDER BY published DESC
         """, (channel_id,)).fetchall()
+
+
+def get_all_episodes_oldest_first() -> list[sqlite3.Row]:
+    """Every episode across all channels, oldest first.
+
+    Used by the disk-pressure pruner (app/downloader.py), which frees space by
+    globally oldest episode rather than per channel — unlike get_episodes(),
+    which is per-channel and newest-first for feed building.
+    """
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM episodes ORDER BY published ASC").fetchall()
 
 
 def get_all_channel_ids() -> list[str]:
@@ -296,3 +315,101 @@ def get_last_poll_run_per_channel() -> dict[str, sqlite3.Row]:
                ON pr.id = last.mid"""
         ).fetchall()
     return {r["channel_id"]: r for r in rows}
+
+
+# --- backups ----------------------------------------------------------------
+
+# One snapshot a night, so this is a week of history. Enough to notice and roll
+# back a problem that took a few days to surface, without the backups
+# themselves becoming the thing that fills the disk (each is roughly the size
+# of the live DB, which is small — it holds metadata, not audio).
+_BACKUP_RETAIN = 7
+
+
+def backup_db() -> str:
+    """Write a timestamped snapshot of the database into BACKUP_DIR.
+
+    VACUUM INTO rather than a file copy or Connection.backup(): the DB runs in
+    WAL mode (see init_db), where the live file on its own is not a complete
+    database — a plain copy without the -wal sidecar can lose the most recent
+    writes. VACUUM INTO takes a read transaction and emits a single, fully
+    checkpointed, non-WAL file, so it is safe to run while polls are writing
+    and the result is one self-contained file with no sidecars to keep with it.
+    Returns the path written.
+    """
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(BACKUP_DIR, f"episodes-{stamp}.db")
+    # VACUUM INTO refuses to write to an existing file rather than overwriting
+    # it. A same-second collision needs two runs of this job in one second,
+    # which shouldn't happen — but a raise here would lose the night's backup,
+    # so fall back to a unique name instead of failing.
+    if os.path.exists(dest):
+        dest = os.path.join(BACKUP_DIR, f"episodes-{stamp}-{secrets.token_hex(2)}.db")
+    with get_conn() as conn:
+        conn.execute("VACUUM INTO ?", (dest,))
+    return dest
+
+
+def prune_backups(retain: int = _BACKUP_RETAIN) -> list[str]:
+    """Delete all but the `retain` newest snapshots. Returns the paths removed.
+
+    The YYYYMMDD-HHMMSS stamp sorts lexicographically, so a plain reverse
+    filename sort is a chronological sort — no stat() per file needed.
+    """
+    try:
+        names = [n for n in os.listdir(BACKUP_DIR)
+                 if n.startswith("episodes-") and n.endswith(".db")]
+    except OSError:
+        # No backup dir yet (first run, or the volume was replaced) — nothing
+        # to prune, and the next backup_db() will create it.
+        return []
+    deleted: list[str] = []
+    for name in sorted(names, reverse=True)[retain:]:
+        path = os.path.join(BACKUP_DIR, name)
+        try:
+            os.remove(path)
+            deleted.append(path)
+        except OSError as exc:
+            logger.warning("Could not delete old backup %s: %s", path, exc)
+    return deleted
+
+
+def integrity_check() -> str:
+    """PRAGMA integrity_check — returns "ok" on a healthy database.
+
+    Kept as a thin wrapper so the backup job's failure path is testable.
+    """
+    with get_conn() as conn:
+        return conn.execute("PRAGMA integrity_check").fetchone()[0]
+
+
+def run_backup_job() -> None:
+    """Scheduled nightly: verify the database, snapshot it, prune old snapshots.
+
+    Detection only — a failing integrity check emails a human rather than
+    attempting an automatic restore, which could overwrite a recoverable
+    database using a condition that is still actively corrupting it.
+    """
+    try:
+        result = integrity_check()
+        if result != "ok":
+            logger.error("Database integrity check FAILED: %s", result)
+            notify.send_backup_failure_alert(
+                f"PRAGMA integrity_check returned: {result}"
+            )
+            # Still take the snapshot: a copy of a damaged-but-readable
+            # database is strictly better than no copy at all, and the
+            # already-retained older snapshots are what you'd actually restore.
+
+        path = backup_db()
+        logger.info("Database backup written: %s (%d bytes)", path, os.path.getsize(path))
+        deleted = prune_backups()
+        if deleted:
+            logger.info("Pruned %d old backup(s), keeping the newest %d",
+                        len(deleted), _BACKUP_RETAIN)
+    except Exception as exc:  # noqa: BLE001 — a scheduled job must never
+        # crash silently; that class of failure is exactly what this pass exists
+        # to eliminate.
+        logger.exception("Database backup job failed")
+        notify.send_backup_failure_alert(f"backup failed: {exc}")

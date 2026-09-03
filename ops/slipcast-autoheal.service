@@ -1,0 +1,14 @@
+[Unit]
+Description=Slipcast autoheal — restart the container when /health/live fails
+Documentation=file:///home/eric/projects/slipcast/ops/README.md
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+User=eric
+WorkingDirectory=/home/eric/projects/slipcast
+ExecStart=/home/eric/projects/slipcast/ops/autoheal.sh
+
+# No [Install] section on purpose — this unit is triggered by
+# slipcast-autoheal.timer, which is the thing you enable.
