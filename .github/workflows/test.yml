@@ -27,3 +27,26 @@ jobs:
       - name: Run tests
         # `python -m pytest` puts the repo root on sys.path so `import app` works.
         run: python -m pytest -q
+
+  # Runs on a self-hosted runner on the lab host itself — GitHub's own hosted
+  # runners can't reach this private host. Gated to push-to-main ONLY
+  # (never pull_request) so untrusted PR code can never execute here; this
+  # job only ever runs post-merge, already-trusted code. Delegates the
+  # actual deploy to lab-sentinel's own guarded engine (fetch + fast-
+  # forward-only pull + docker compose build/up + health-check, refuses
+  # rather than forces on a dirty/diverged checkout) rather than
+  # reimplementing that logic here.
+  deploy:
+    name: Deploy to lab
+    needs: pytest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, lab]
+    steps:
+      - name: Trigger lab-sentinel deploy
+        run: |
+          curl -sf -X POST http://127.0.0.1:7891/api/deploy \
+            -H 'Content-Type: application/json' \
+            -d '{"repo":"slipcast","containerName":"slipcast-app-1"}' \
+            -o deploy-result.json
+          cat deploy-result.json
+          jq -e '.deployStatus == "done"' deploy-result.json
