@@ -5,6 +5,12 @@ services:
     build: .
     image: ericfaris/slipcast:latest
     restart: unless-stopped
+    # Hardening: block privilege escalation. Full `cap_drop: [ALL]` is NOT safe
+    # here — the image's non-root user relies on the default-granted DAC_OVERRIDE
+    # to write the root-owned files under ./data (episodes.db, audio/, ...).
+    # To harden further: `sudo chown -R <image-uid> data/`, then `user:` + cap_drop.
+    security_opt:
+      - no-new-privileges:true
     # Probes /health/live — the restart-fixable subset of the health report
     # (scheduler up, polling not stalled). Not /health: that also fails on
     # expired cookies and low disk, which a restart cannot fix, so an automated
