@@ -32,7 +32,7 @@ jobs:
   # runners can't reach this private host. Gated to push-to-main ONLY
   # (never pull_request) so untrusted PR code can never execute here; this
   # job only ever runs post-merge, already-trusted code. Delegates the
-  # actual deploy to lab-sentinel's own guarded engine (fetch + fast-
+  # actual deploy to sentinel's own guarded engine (fetch + fast-
   # forward-only pull + docker compose build/up + health-check, refuses
   # rather than forces on a dirty/diverged checkout) rather than
   # reimplementing that logic here.
@@ -42,7 +42,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, lab]
     steps:
-      - name: Trigger lab-sentinel deploy
+      - name: Trigger sentinel deploy
         run: |
           curl -sf -X POST http://127.0.0.1:7891/api/deploy \
             -H 'Content-Type: application/json' \
