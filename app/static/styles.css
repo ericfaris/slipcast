@@ -1,5 +1,53 @@
-/* Slipcast dashboard — design system */
+/* ===========================================================================
+   Slipcast design system — "Signal Deck"
+   A broadcast-control-room identity for a self-hosted YouTube→podcast relay:
+   the dashboard reads like the panel of the machine doing the relaying —
+   dark ink surfaces, an electric violet/red "on-air" signal color, a
+   technical monospace for anything numeric or machine-generated (countdowns,
+   tokens, versions), and a condensed display face for headings. See
+   /DESIGN.md at the repo root for the full rationale, scale, and component
+   inventory; this file is the tokens' single source of truth — the static
+   showcase at /static/design-system.html renders every one of them live.
+   =========================================================================== */
+
+@font-face {
+  font-family: 'Chakra Petch';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/static/fonts/chakra-petch-500.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Chakra Petch';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/static/fonts/chakra-petch-600.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Chakra Petch';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/static/fonts/chakra-petch-700.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Manrope';
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  src: url('/static/fonts/manrope-variable.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/static/fonts/jetbrains-mono-variable.woff2') format('woff2');
+}
+
 :root {
+  /* ---- Color: surfaces + ink ---- */
   --bg: #f5f6fb;
   --surface: #ffffff;
   --surface-2: #f9fafe;
@@ -7,22 +55,66 @@
   --muted: #6b7191;
   --faint: #9aa0c0;
   --border: #e7e9f4;
+
+  /* ---- Color: brand + semantic ---- */
   --primary: #6d28d9;
   --primary-ink: #ffffff;
   --primary-soft: #efe7fd;
   --accent: #0ea5a4;
-  --brand-a: #f40a02;
-  --brand-b: #5415a0;
+  --accent-soft: #e3f7f6;
+  --brand-a: #f40a02;   /* YouTube-red end of the signal gradient */
+  --brand-b: #5415a0;   /* podcast-violet end of the signal gradient */
   --success: #16a34a;
   --success-soft: #e7f6ed;
   --warn: #b45309;
   --warn-soft: #fdf2e0;
   --danger: #dc2626;
   --danger-soft: #fdecec;
+
+  /* ---- Type ---- */
+  --font-display: 'Chakra Petch', ui-sans-serif, system-ui, sans-serif;
+  --font-body: 'Manrope', ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --text-xs: 0.72rem;     /* 11.5px — badges, captions, fine print */
+  --text-sm: 0.8125rem;   /* 13px   — meta lines, secondary labels */
+  --text-base: 0.9375rem; /* 15px   — body copy, form inputs */
+  --text-md: 1.0625rem;   /* 17px   — card titles, subheads */
+  --text-lg: 1.25rem;     /* 20px   — section headings */
+  --text-xl: 1.6rem;      /* 25.6px — dialog/page titles */
+  --text-2xl: 2.1rem;     /* 33.6px — hero numbers, empty-state */
+  --text-3xl: 2.75rem;    /* 44px   — showcase display specimens */
+
+  /* ---- Space (4px base) ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 28px;
+  --space-7: 36px;
+  --space-8: 48px;
+
+  /* ---- Radius ---- */
+  --radius-xs: 6px;
+  --radius-sm: 10px;
+  --radius: 16px;
+  --radius-lg: 22px;
+  --radius-pill: 999px;
+
+  /* ---- Shadow / glow ---- */
+  --shadow-sm: 0 1px 2px rgba(24, 27, 46, .05);
   --shadow: 0 1px 2px rgba(24, 27, 46, .04), 0 8px 24px rgba(24, 27, 46, .06);
   --shadow-lg: 0 12px 40px rgba(24, 27, 46, .18);
-  --radius: 16px;
-  --radius-sm: 10px;
+  --shadow-signal: 0 0 0 1px rgba(109, 40, 217, .14), 0 10px 30px -6px rgba(109, 40, 217, .35);
+
+  /* ---- Motion ---- */
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+  --ease-spring: cubic-bezier(.34, 1.56, .64, 1);
+  --dur-fast: 120ms;   /* hover/press micro-feedback */
+  --dur-base: 200ms;   /* default UI transitions */
+  --dur-slow: 420ms;   /* panel reveals, gauge sweep */
+
   --ring: 0 0 0 3px rgba(109, 40, 217, .35);
   --maxw: 1080px;
 }
@@ -38,11 +130,13 @@
     --border: #2a2f4f;
     --primary: #9d7bff;
     --primary-soft: #2c1e50;
+    --accent-soft: #123634;
     --success-soft: #14301f;
     --warn-soft: #3a2a12;
     --danger-soft: #3a1c1c;
     --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
     --shadow-lg: 0 16px 48px rgba(0,0,0,.55);
+    --shadow-signal: 0 0 0 1px rgba(157, 123, 255, .22), 0 10px 34px -4px rgba(157, 123, 255, .4);
   }
 }
 
@@ -54,11 +148,14 @@
 html { -webkit-text-size-adjust: 100%; }
 
 body {
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  background: var(--bg);
+  font-family: var(--font-body);
+  background:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--primary) 14%, transparent) 1px, transparent 0) 0 0 / 22px 22px,
+    var(--bg);
   color: var(--ink);
   min-height: 100vh;
   line-height: 1.5;
+  font-size: var(--text-base);
   -webkit-font-smoothing: antialiased;
 }
 
@@ -92,7 +189,8 @@ a { color: var(--primary); }
 .brand { display: flex; align-items: center; gap: 10px; }
 .brand-mark { color: var(--primary); display: block; }
 .brand-name {
-  font-weight: 700; font-size: 1.12rem; letter-spacing: -.02em;
+  font-family: var(--font-display); font-weight: 600; font-size: var(--text-md);
+  letter-spacing: .01em;
 }
 .appbar-actions { display: flex; align-items: center; gap: 12px; }
 .activity {
@@ -126,7 +224,8 @@ a { color: var(--primary); }
   gap: 12px; margin-bottom: 14px; flex-wrap: wrap;
 }
 .section-head h2 {
-  font-size: 1.18rem; letter-spacing: -.02em; display: flex; align-items: center; gap: 10px;
+  font-family: var(--font-display); font-weight: 600;
+  font-size: var(--text-lg); letter-spacing: 0; display: flex; align-items: center; gap: 10px;
 }
 .count-pill {
   font-size: .72rem; font-weight: 600; color: var(--muted);
@@ -147,12 +246,12 @@ a { color: var(--primary); }
   position: absolute; inset: 0; display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 1px;
 }
-.poll-gauge-num { font-size: 1.05rem; font-weight: 700; color: var(--ink); letter-spacing: -.02em; line-height: 1; }
+.poll-gauge-num { font-family: var(--font-mono); font-size: 1rem; font-weight: 700; color: var(--ink); letter-spacing: -.02em; line-height: 1; }
 .poll-gauge-cap { font-size: .58rem; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); }
 
 .poll-info { min-width: 0; }
 .poll-title-row { display: flex; align-items: center; gap: 10px; }
-.poll-title-row h2 { font-size: 1.05rem; letter-spacing: -.02em; }
+.poll-title-row h2 { font-family: var(--font-display); font-weight: 600; font-size: var(--text-md); letter-spacing: 0; }
 .pill {
   font-size: .68rem; font-weight: 600; color: var(--primary);
   background: var(--primary-soft); border-radius: 999px; padding: 2px 9px;
@@ -170,7 +269,7 @@ a { color: var(--primary); }
 .pr-dot.err { background: var(--danger); }
 .pr-dot.idle { background: var(--faint); }
 .pr-name { color: var(--ink); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 230px; }
-.pr-time { color: var(--faint); margin-left: auto; font-size: .74rem; white-space: nowrap; }
+.pr-time { color: var(--faint); margin-left: auto; font-family: var(--font-mono); font-size: .72rem; white-space: nowrap; }
 .pr-status { font-size: .72rem; font-weight: 600; flex: none; }
 .pr-status.ok { color: var(--success); }
 .pr-status.err { color: var(--danger); cursor: help; }
@@ -217,23 +316,36 @@ input[type=text], input[type=search], input[type=file], select {
 /* ---- Buttons ---- */
 .btn {
   font: inherit; font-size: .86rem; font-weight: 600; cursor: pointer;
-  border: 1px solid transparent; border-radius: 10px; padding: 10px 16px;
-  white-space: nowrap; transition: background .15s, border-color .15s, transform .05s, color .15s;
+  border: 1px solid transparent; border-radius: var(--radius-sm); padding: 10px 16px;
+  white-space: nowrap;
+  transition: background var(--dur-base) var(--ease-out), border-color var(--dur-base) var(--ease-out),
+              transform var(--dur-fast) var(--ease-spring), color var(--dur-base) var(--ease-out),
+              box-shadow var(--dur-base) var(--ease-out);
   display: inline-flex; align-items: center; gap: 7px; text-decoration: none; line-height: 1;
 }
-.btn:active { transform: translateY(1px); }
-.btn-primary { background: var(--primary); color: var(--primary-ink); }
-.btn-primary:hover { background: color-mix(in srgb, var(--primary) 85%, #000); }
+.btn:active { transform: translateY(1px) scale(.98); }
+/* Signature control — the primary action on every form in the app (Add
+   Channel, Download, Save, Poll all now). Carries the brand's red→violet
+   signal gradient so the one action that matters per screen reads as "on
+   air" against the flatter ghost/text buttons around it. */
+.btn-primary {
+  background: linear-gradient(135deg, var(--brand-a) -40%, var(--primary) 70%);
+  color: var(--primary-ink);
+  box-shadow: var(--shadow-signal);
+}
+.btn-primary:hover { transform: translateY(-1px); filter: brightness(1.06); box-shadow: var(--shadow-signal), var(--shadow-lg); }
+.btn-primary:active { transform: translateY(0) scale(.98); filter: brightness(.97); }
 .btn-ghost { background: var(--surface); color: var(--ink); border-color: var(--border); }
 .btn-ghost:hover { background: var(--surface-2); border-color: var(--faint); }
 .btn-text { background: none; color: var(--muted); padding: 8px 10px; }
 .btn-text:hover { color: var(--ink); }
 .btn-danger-ghost { background: var(--surface); color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); }
 .btn-danger-ghost:hover { background: var(--danger-soft); }
-.btn-sm { padding: 7px 12px; font-size: .8rem; border-radius: 8px; }
+.btn-sm { padding: 7px 12px; font-size: .8rem; border-radius: var(--radius-xs); }
 .btn-icon { background: none; color: var(--muted); padding: 8px; border-radius: 9px; }
 .btn-icon:hover { background: var(--surface-2); color: var(--ink); }
-.btn[disabled] { opacity: .5; cursor: not-allowed; }
+.btn[disabled] { opacity: .5; cursor: not-allowed; box-shadow: none; }
+.btn[disabled]:hover { transform: none; filter: none; }
 
 /* ---- Toolbar / bulk ---- */
 .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 14px 0; }
@@ -347,12 +459,12 @@ input[type=text], input[type=search], input[type=file], select {
   text-align: center; border: 1px solid var(--border);
 }
 .modal-close { position: absolute; top: 10px; right: 12px; background: none; border: none; font-size: 1.5rem; color: var(--muted); cursor: pointer; line-height: 1; }
-.modal-card h3 { font-size: 1.1rem; margin-bottom: 4px; }
+.modal-card h3 { font-family: var(--font-display); font-weight: 600; font-size: var(--text-lg); margin-bottom: 4px; }
 .share-name { color: var(--muted); font-size: .85rem; margin-bottom: 16px; }
 .share-qr { display: grid; place-items: center; margin: 0 auto 16px; }
 .share-qr img, .share-qr canvas { width: 180px; height: 180px; border-radius: 10px; background: #fff; padding: 8px; }
 .share-url { display: flex; gap: 8px; margin-bottom: 12px; }
-.share-url input { flex: 1; min-width: 0; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--ink); font-size: .8rem; }
+.share-url input { flex: 1; min-width: 0; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--ink); font-family: var(--font-mono); font-size: .76rem; }
 .share-apps { display: flex; gap: 8px; }
 .share-apps .btn { flex: 1; justify-content: center; }
 
@@ -385,12 +497,12 @@ input[type=text], input[type=search], input[type=file], select {
 /* ---- Settings / About modal ---- */
 .about-meta { display: flex; flex-wrap: wrap; gap: 8px 28px; margin: 14px 0 4px; }
 .about-meta dt { font-size: .68rem; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); }
-.about-meta dd { font-size: .9rem; font-weight: 600; color: var(--ink); margin-top: 2px; }
+.about-meta dd { font-family: var(--font-mono); font-size: .9rem; font-weight: 600; color: var(--ink); margin-top: 2px; }
 .about-h { font-size: .72rem; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); margin: 18px 0 6px; }
 .changelog { max-height: 52vh; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
 .cl-entry { border-left: 2px solid var(--border); padding-left: 14px; }
 .cl-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.cl-version { font-weight: 700; font-size: .92rem; color: var(--ink); }
+.cl-version { font-family: var(--font-display); font-weight: 600; font-size: .92rem; color: var(--ink); }
 .cl-date { font-size: .76rem; color: var(--muted); margin-left: auto; }
 .cl-badge { font-size: .64rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--primary); background: var(--primary-soft); border-radius: 999px; padding: 2px 8px; }
 .cl-changes { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }

@@ -744,6 +744,9 @@ _PAGE = """<!DOCTYPE html>
             </dl>
             <h4 class="about-h">Changelog</h4>
             <div id="changelog-list" class="changelog"></div>
+            <p class="share-name" style="margin-top:14px;margin-bottom:0">
+                <a href="/static/design-system.html" target="_blank" rel="noopener">View design system &rarr;</a>
+            </p>
         </div>
     </div>
 

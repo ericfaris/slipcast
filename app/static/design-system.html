@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="/static/favicon.ico" sizes="48x48">
+<link rel="stylesheet" href="/static/styles.css">
+<title>Slipcast — Design System</title>
+<style>
+  /* Showcase-only scaffolding. Never redefines a Slipcast token — every
+     color/type/space/radius/shadow value on this page comes from the real
+     /static/styles.css, loaded above like any other page in the app. */
+  .ds-wrap { max-width: 1080px; margin: 0 auto; padding: 28px 20px 100px; }
+  .ds-hero {
+    padding: 40px 28px; border-radius: var(--radius-lg); margin-bottom: 40px;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--brand-a) 16%, var(--surface)), color-mix(in srgb, var(--brand-b) 18%, var(--surface)));
+    border: 1px solid var(--border);
+  }
+  .ds-hero h1 {
+    font-family: var(--font-display); font-weight: 700; font-size: var(--text-3xl);
+    letter-spacing: -.01em; display: flex; align-items: center; gap: 14px;
+  }
+  .ds-hero p { color: var(--muted); margin-top: 10px; max-width: 62ch; font-size: var(--text-md); }
+  .ds-hero .pill { margin-top: 16px; }
+  .ds-section { margin: 56px 0; }
+  .ds-section > h2 {
+    font-family: var(--font-display); font-weight: 600; font-size: var(--text-xl);
+    border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 20px;
+  }
+  .ds-section > p.ds-desc { color: var(--muted); margin: -10px 0 22px; max-width: 70ch; font-size: var(--text-sm); }
+  .ds-subhead {
+    font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase;
+    letter-spacing: .08em; color: var(--faint); margin: 28px 0 12px;
+  }
+  .ds-subhead:first-child { margin-top: 0; }
+
+  /* Color swatches */
+  .swatch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px; }
+  .swatch { border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border); background: var(--surface); }
+  .swatch-fill { height: 64px; }
+  .swatch-meta { padding: 8px 10px; }
+  .swatch-name { font-size: var(--text-sm); font-weight: 700; color: var(--ink); }
+  .swatch-val { font-family: var(--font-mono); font-size: .72rem; color: var(--muted); }
+  .swatch-role { font-size: .68rem; color: var(--faint); margin-top: 2px; }
+
+  /* Type scale */
+  .type-row { display: flex; align-items: baseline; gap: 20px; padding: 14px 0; border-bottom: 1px dashed var(--border); }
+  .type-row:last-child { border-bottom: none; }
+  .type-meta { flex: none; width: 190px; font-family: var(--font-mono); font-size: .72rem; color: var(--muted); line-height: 1.5; }
+  .type-sample { min-width: 0; color: var(--ink); }
+  .font-specimen { display: flex; gap: 28px; flex-wrap: wrap; margin-bottom: 24px; }
+  .font-card { flex: 1; min-width: 220px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+  .font-card .fc-label { font-family: var(--font-mono); font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--faint); margin-bottom: 8px; }
+  .font-card .fc-sample { font-size: 1.9rem; }
+  .font-card.display .fc-sample { font-family: var(--font-display); font-weight: 700; }
+  .font-card.body .fc-sample { font-family: var(--font-body); font-weight: 700; }
+  .font-card.mono .fc-sample { font-family: var(--font-mono); font-weight: 600; font-size: 1.5rem; }
+
+  /* Space / radius scale */
+  .scale-row { display: flex; align-items: center; gap: 16px; margin-bottom: 10px; }
+  .scale-box { background: var(--primary); flex: none; height: 28px; border-radius: 4px; }
+  .scale-label { font-family: var(--font-mono); font-size: .78rem; color: var(--muted); width: 170px; flex: none; }
+  .radius-row { display: flex; gap: 20px; flex-wrap: wrap; }
+  .radius-demo {
+    width: 84px; height: 84px; background: var(--primary-soft); border: 2px solid var(--primary);
+    display: flex; align-items: flex-end; justify-content: center; padding-bottom: 8px;
+    font-family: var(--font-mono); font-size: .68rem; color: var(--primary); text-align: center;
+  }
+
+  /* Shadow cards */
+  .shadow-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 28px; }
+  .shadow-card {
+    background: var(--surface); border-radius: var(--radius); padding: 22px 16px; text-align: center;
+    font-family: var(--font-mono); font-size: .76rem; color: var(--muted);
+  }
+
+  /* Motion demo */
+  .motion-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+  .motion-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 18px; cursor: pointer; text-align: center; font-family: var(--font-mono); font-size: .78rem; color: var(--muted);
+    transition: transform var(--dur-base) var(--ease-out), box-shadow var(--dur-base) var(--ease-out), background var(--dur-base) var(--ease-out);
+  }
+  .motion-card:hover, .motion-card:focus-visible { transform: translateY(-6px) scale(1.02); box-shadow: var(--shadow-lg); background: var(--surface-2); }
+  .motion-card.spring:hover { transform: translateY(-6px) scale(1.06); transition-timing-function: var(--ease-spring); }
+  .motion-card b { display: block; font-family: var(--font-body); color: var(--ink); font-size: .92rem; margin-bottom: 4px; }
+
+  /* Component showcase groups */
+  .comp-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .comp-grid-2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+  .comp-label { font-family: var(--font-mono); font-size: .7rem; color: var(--faint); text-transform: uppercase; letter-spacing: .06em; margin: 4px 0 8px; }
+
+  /* Texture samples */
+  .texture-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }
+  .texture-sample { height: 140px; border-radius: var(--radius); border: 1px solid var(--border); position: relative; overflow: hidden; }
+  .texture-sample span {
+    position: absolute; bottom: 10px; left: 12px; font-family: var(--font-mono); font-size: .68rem;
+    color: var(--faint); background: color-mix(in srgb, var(--surface) 70%, transparent); padding: 2px 6px; border-radius: 4px;
+  }
+  .tex-dotgrid { background: radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--primary) 26%, transparent) 1px, transparent 0) 0 0/22px 22px, var(--bg); }
+  .tex-signal-glow { background: radial-gradient(circle at 30% 30%, color-mix(in srgb, var(--brand-a) 30%, transparent), transparent 60%),
+                                 radial-gradient(circle at 70% 70%, color-mix(in srgb, var(--brand-b) 34%, transparent), transparent 60%), var(--surface); }
+  .tex-scope {
+    background: var(--surface);
+    background-image: repeating-linear-gradient(90deg, color-mix(in srgb, var(--border) 90%, transparent) 0 1px, transparent 1px 8px);
+  }
+
+  footer.ds-foot { text-align: center; color: var(--faint); font-size: .78rem; padding: 40px 0 10px; font-family: var(--font-mono); }
+  footer.ds-foot a { color: var(--primary); }
+</style>
+</head>
+<body>
+<header class="appbar">
+  <div class="appbar-inner">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 48 48" aria-hidden="true" width="26" height="26">
+        <defs>
+          <linearGradient id="sc-grad" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#F40A02"/>
+            <stop offset="1" stop-color="#5415A0"/>
+          </linearGradient>
+        </defs>
+        <path d="M8 13.5c0-3.5 3.8-5.7 6.8-3.9l15 9.1c2.9 1.8 2.9 6 0 7.8l-15 9.1c-3 1.8-6.8-.4-6.8-3.9V13.5z" fill="url(#sc-grad)"/>
+        <path d="M34 17a10.5 10.5 0 0 1 0 14" fill="none" stroke="url(#sc-grad)" stroke-width="3.6" stroke-linecap="round"/>
+        <path d="M39.5 12.5a17.5 17.5 0 0 1 0 23" fill="none" stroke="url(#sc-grad)" stroke-width="3.6" stroke-linecap="round"/>
+      </svg>
+      <span class="brand-name">Slipcast</span>
+    </div>
+    <div class="appbar-actions"><span class="pill">Design system</span></div>
+  </div>
+</header>
+
+<div class="ds-wrap">
+  <div class="ds-hero">
+    <h1>
+      <svg viewBox="0 0 48 48" aria-hidden="true" width="40" height="40">
+        <defs><linearGradient id="hero-grad" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#F40A02"/><stop offset="1" stop-color="#5415A0"/>
+        </linearGradient></defs>
+        <path d="M8 13.5c0-3.5 3.8-5.7 6.8-3.9l15 9.1c2.9 1.8 2.9 6 0 7.8l-15 9.1c-3 1.8-6.8-.4-6.8-3.9V13.5z" fill="url(#hero-grad)"/>
+        <path d="M34 17a10.5 10.5 0 0 1 0 14" fill="none" stroke="url(#hero-grad)" stroke-width="3.6" stroke-linecap="round"/>
+        <path d="M39.5 12.5a17.5 17.5 0 0 1 0 23" fill="none" stroke="url(#hero-grad)" stroke-width="3.6" stroke-linecap="round"/>
+      </svg>
+      Signal Deck
+    </h1>
+    <p>Slipcast's design system — a broadcast-control-room identity for a self-hosted YouTube→podcast relay. Every token and component below is rendered live from this app's own <code>/static/styles.css</code>, not redrawn. See <code>DESIGN.md</code> in the repo root for the full narrative.</p>
+    <span class="pill">v1.0 · Signal Deck</span>
+  </div>
+
+  <!-- ============================== COLOR ============================== -->
+  <section class="ds-section" id="color">
+    <h2>Color</h2>
+    <p class="ds-desc">Surfaces and ink flip automatically with the OS color scheme (<code>prefers-color-scheme</code>) — toggle your system theme to see every swatch below repaint. Brand-a/brand-b are the fixed red→violet signal gradient used in the logomark and primary buttons; they intentionally do not shift between themes.</p>
+
+    <div class="ds-subhead">Surfaces &amp; ink</div>
+    <div class="swatch-grid">
+      <div class="swatch"><div class="swatch-fill" style="background:var(--bg)"></div><div class="swatch-meta"><div class="swatch-name">--bg</div><div class="swatch-val">page background</div><div class="swatch-role">base canvas</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--surface)"></div><div class="swatch-meta"><div class="swatch-name">--surface</div><div class="swatch-val">card / panel fill</div><div class="swatch-role">surface</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--surface-2)"></div><div class="swatch-meta"><div class="swatch-name">--surface-2</div><div class="swatch-val">recessed fill</div><div class="swatch-role">surface</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--ink)"></div><div class="swatch-meta"><div class="swatch-name">--ink</div><div class="swatch-val">primary text</div><div class="swatch-role">ink · AA on --surface</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--muted)"></div><div class="swatch-meta"><div class="swatch-name">--muted</div><div class="swatch-val">secondary text</div><div class="swatch-role">ink</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--faint)"></div><div class="swatch-meta"><div class="swatch-name">--faint</div><div class="swatch-val">tertiary / captions</div><div class="swatch-role">ink</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--border)"></div><div class="swatch-meta"><div class="swatch-name">--border</div><div class="swatch-val">hairlines</div><div class="swatch-role">border</div></div></div>
+    </div>
+
+    <div class="ds-subhead">Brand &amp; signal</div>
+    <div class="swatch-grid">
+      <div class="swatch"><div class="swatch-fill" style="background:var(--primary)"></div><div class="swatch-meta"><div class="swatch-name">--primary</div><div class="swatch-val">actions, links, focus</div><div class="swatch-role">accent</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--primary-soft)"></div><div class="swatch-meta"><div class="swatch-name">--primary-soft</div><div class="swatch-val">pills, selected state</div><div class="swatch-role">accent (soft)</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--accent)"></div><div class="swatch-meta"><div class="swatch-name">--accent</div><div class="swatch-val">teal — reserved</div><div class="swatch-role">accent 2</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--accent-soft)"></div><div class="swatch-meta"><div class="swatch-name">--accent-soft</div><div class="swatch-val">teal soft fill</div><div class="swatch-role">accent 2 (soft)</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--brand-a)"></div><div class="swatch-meta"><div class="swatch-name">--brand-a</div><div class="swatch-val">#F40A02 fixed</div><div class="swatch-role">logomark / gradient</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--brand-b)"></div><div class="swatch-meta"><div class="swatch-name">--brand-b</div><div class="swatch-val">#5415A0 fixed</div><div class="swatch-role">logomark / gradient</div></div></div>
+    </div>
+
+    <div class="ds-subhead">Semantic (good / warn / bad)</div>
+    <div class="swatch-grid">
+      <div class="swatch"><div class="swatch-fill" style="background:var(--success)"></div><div class="swatch-meta"><div class="swatch-name">--success</div><div class="swatch-val">healthy, ok</div><div class="swatch-role">semantic</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--success-soft)"></div><div class="swatch-meta"><div class="swatch-name">--success-soft</div><div class="swatch-val">success fill</div><div class="swatch-role">semantic (soft)</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--warn)"></div><div class="swatch-meta"><div class="swatch-name">--warn</div><div class="swatch-val">expiring, aging</div><div class="swatch-role">semantic</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--warn-soft)"></div><div class="swatch-meta"><div class="swatch-name">--warn-soft</div><div class="swatch-val">warn fill</div><div class="swatch-role">semantic (soft)</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--danger)"></div><div class="swatch-meta"><div class="swatch-name">--danger</div><div class="swatch-val">failed, destructive</div><div class="swatch-role">semantic</div></div></div>
+      <div class="swatch"><div class="swatch-fill" style="background:var(--danger-soft)"></div><div class="swatch-meta"><div class="swatch-name">--danger-soft</div><div class="swatch-val">danger fill</div><div class="swatch-role">semantic (soft)</div></div></div>
+    </div>
+  </section>
+
+  <!-- ============================== TYPE ============================== -->
+  <section class="ds-section" id="type">
+    <h2>Type</h2>
+    <p class="ds-desc">Three self-hosted faces, each with one job: Chakra Petch (display, headings/wordmark), Manrope (body, everything you read), JetBrains Mono (technical readouts — countdowns, tokens, versions, timestamps).</p>
+
+    <div class="font-specimen">
+      <div class="font-card display"><div class="fc-label">--font-display · Chakra Petch 700</div><div class="fc-sample">Slipcast</div></div>
+      <div class="font-card body"><div class="fc-label">--font-body · Manrope 700</div><div class="fc-sample">Add Channel</div></div>
+      <div class="font-card mono"><div class="fc-label">--font-mono · JetBrains Mono 600</div><div class="fc-sample">01:59:42</div></div>
+    </div>
+
+    <div class="ds-subhead">Type scale</div>
+    <div class="type-row"><div class="type-meta">--text-3xl<br>2.75rem / 700 / display<br>showcase specimens</div><div class="type-sample" style="font-family:var(--font-display);font-weight:700;font-size:var(--text-3xl)">Signal Deck</div></div>
+    <div class="type-row"><div class="type-meta">--text-2xl<br>2.1rem / 700 / display<br>hero numbers, empty states</div><div class="type-sample" style="font-family:var(--font-display);font-weight:700;font-size:var(--text-2xl)">128 episodes</div></div>
+    <div class="type-row"><div class="type-meta">--text-xl<br>1.6rem / 600 / display<br>dialog &amp; page titles</div><div class="type-sample" style="font-family:var(--font-display);font-weight:600;font-size:var(--text-xl)">Share feed</div></div>
+    <div class="type-row"><div class="type-meta">--text-lg<br>1.25rem / 600 / display<br>section headings (h2)</div><div class="type-sample" style="font-family:var(--font-display);font-weight:600;font-size:var(--text-lg)">Subscribed channels</div></div>
+    <div class="type-row"><div class="type-meta">--text-md<br>1.0625rem / 600 / body<br>card titles, subheads</div><div class="type-sample" style="font-weight:650;font-size:var(--text-md)">Channel name</div></div>
+    <div class="type-row"><div class="type-meta">--text-base<br>0.9375rem / 400 / body<br>body copy, inputs</div><div class="type-sample" style="font-size:var(--text-base)">Paste a YouTube channel URL to start building a podcast feed.</div></div>
+    <div class="type-row"><div class="type-meta">--text-sm<br>0.8125rem / 400 / body<br>meta lines, secondary</div><div class="type-sample" style="font-size:var(--text-sm);color:var(--muted)">Last polled 12m ago</div></div>
+    <div class="type-row"><div class="type-meta">--text-xs<br>0.72rem / 600 / body<br>badges, fine print</div><div class="type-sample" style="font-size:var(--text-xs);font-weight:600;color:var(--muted)">20 episodes</div></div>
+    <div class="type-row"><div class="type-meta">mono readout<br>JetBrains Mono 700<br>countdowns, tokens, versions</div><div class="type-sample" style="font-family:var(--font-mono);font-weight:700">1h 42m</div></div>
+  </section>
+
+  <!-- ============================== SPACE / RADIUS ============================== -->
+  <section class="ds-section" id="space">
+    <h2>Spacing &amp; radius</h2>
+    <p class="ds-desc">An 4px-based spacing scale and a five-step radius scale, from tight badge corners up to the pill shapes used for tags and countdown chips.</p>
+
+    <div class="ds-subhead">Spacing scale</div>
+    <div class="scale-row"><div class="scale-label">--space-1 · 4px</div><div class="scale-box" style="width:var(--space-1)"></div></div>
+    <div class="scale-row"><div class="scale-label">--space-2 · 8px</div><div class="scale-box" style="width:var(--space-2)"></div></div>
+    <div class="scale-row"><div class="scale-label">--space-3 · 12px</div><div class="scale-box" style="width:var(--space-3)"></div></div>
+    <div class="scale-row"><div class="scale-label">--space-4 · 16px</div><div class="scale-box" style="width:var(--space-4)"></div></div>
+    <div class="scale-row"><div class="scale-label">--space-5 · 20px</div><div class="scale-box" style="width:var(--space-5)"></div></div>
+    <div class="scale-row"><div class="scale-label">--space-6 · 28px</div><div class="scale-box" style="width:var(--space-6)"></div></div>
+    <div class="scale-row"><div class="scale-label">--space-7 · 36px</div><div class="scale-box" style="width:var(--space-7)"></div></div>
+    <div class="scale-row"><div class="scale-label">--space-8 · 48px</div><div class="scale-box" style="width:var(--space-8)"></div></div>
+
+    <div class="ds-subhead">Radius scale</div>
+    <div class="radius-row">
+      <div class="radius-demo" style="border-radius:var(--radius-xs)">--radius-xs<br>6px</div>
+      <div class="radius-demo" style="border-radius:var(--radius-sm)">--radius-sm<br>10px</div>
+      <div class="radius-demo" style="border-radius:var(--radius)">--radius<br>16px</div>
+      <div class="radius-demo" style="border-radius:var(--radius-lg)">--radius-lg<br>22px</div>
+      <div class="radius-demo" style="border-radius:var(--radius-pill)">--radius-pill<br>999px</div>
+    </div>
+  </section>
+
+  <!-- ============================== SHADOW / MOTION ============================== -->
+  <section class="ds-section" id="motion">
+    <h2>Shadow &amp; motion</h2>
+    <p class="ds-desc">Hover or focus each card below — the transition actually runs using the named token, so the feel can be checked, not just read as a number. Respects <code>prefers-reduced-motion</code> (all durations collapse to ~0 automatically).</p>
+
+    <div class="ds-subhead">Shadow tokens</div>
+    <div class="shadow-grid">
+      <div class="shadow-card" style="box-shadow:var(--shadow-sm)">--shadow-sm</div>
+      <div class="shadow-card" style="box-shadow:var(--shadow)">--shadow</div>
+      <div class="shadow-card" style="box-shadow:var(--shadow-lg)">--shadow-lg</div>
+      <div class="shadow-card" style="box-shadow:var(--shadow-signal)">--shadow-signal</div>
+    </div>
+
+    <div class="ds-subhead">Motion tokens (hover/focus to trigger)</div>
+    <div class="motion-grid">
+      <div class="motion-card" tabindex="0" style="transition-duration:var(--dur-fast)"><b>--dur-fast</b>120ms · micro feedback</div>
+      <div class="motion-card" tabindex="0" style="transition-duration:var(--dur-base)"><b>--dur-base</b>200ms · default UI</div>
+      <div class="motion-card spring" tabindex="0" style="transition-duration:var(--dur-slow)"><b>--dur-slow / --ease-spring</b>420ms · panel reveal</div>
+    </div>
+  </section>
+
+  <!-- ============================== BACKGROUNDS / TEXTURE ============================== -->
+  <section class="ds-section" id="texture">
+    <h2>Backgrounds &amp; texture</h2>
+    <p class="ds-desc">Pure-CSS textures (no image weight) that carry the "broadcast console" feel: an oscilloscope dot-grid behind the whole app, a signal-glow wash used on this page's hero, and a scanline pattern reserved for future technical panels.</p>
+    <div class="texture-grid">
+      <div class="texture-sample tex-dotgrid"><span>oscilloscope dot-grid — body background</span></div>
+      <div class="texture-sample tex-signal-glow"><span>signal glow — brand-a/brand-b wash</span></div>
+      <div class="texture-sample tex-scope"><span>scanline ticks — reserved, technical panels</span></div>
+    </div>
+  </section>
+
+  <!-- ============================== COMPONENTS ============================== -->
+  <section class="ds-section" id="components">
+    <h2>Components</h2>
+    <p class="ds-desc">Real markup and CSS from the app — the same classes rendered by <code>app.js</code>, not redrawn approximations.</p>
+
+    <div class="comp-label">Buttons — variants</div>
+    <div class="comp-row">
+      <button class="btn btn-primary" type="button">Add Channel</button>
+      <button class="btn btn-ghost" type="button">Share</button>
+      <button class="btn btn-text" type="button">Clear</button>
+      <button class="btn btn-danger-ghost" type="button">Remove</button>
+      <button class="btn btn-primary" type="button" disabled>Add Channel</button>
+    </div>
+    <div class="comp-label">Buttons — sizes &amp; icon</div>
+    <div class="comp-row">
+      <button class="btn btn-primary btn-sm" type="button">Poll all now</button>
+      <button class="btn btn-ghost btn-sm" type="button">Feed settings</button>
+      <button class="btn btn-icon" type="button" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+
+    <div class="comp-label">Form (inline-form)</div>
+    <form class="inline-form" onsubmit="return false">
+      <input type="text" placeholder="Paste a YouTube channel URL — e.g. https://youtube.com/@channel">
+      <button class="btn btn-primary" type="submit">Add channel</button>
+    </form>
+
+    <div class="comp-label">Pills, badges &amp; counts</div>
+    <div class="comp-row">
+      <span class="pill">every 2h</span>
+      <span class="count-pill">14</span>
+      <span class="ep-badge">20 episodes</span>
+      <span class="ep-badge zero">no episodes yet</span>
+      <span class="ep-badge link">42 episodes</span>
+    </div>
+
+    <div class="comp-label">Poll health &amp; run rows</div>
+    <div class="comp-row" style="gap:22px">
+      <span class="poll-health good">all healthy</span>
+      <span class="poll-health bad">2 failing</span>
+    </div>
+    <div class="card" style="padding:6px 14px;max-width:420px">
+      <div class="pr-row"><span class="pr-dot ok" aria-hidden="true"></span><span class="pr-name">Continuous Delivery</span><span class="pr-time">2h 04m</span><span class="pr-status ok">+3 new</span></div>
+      <div class="pr-row"><span class="pr-dot err" aria-hidden="true"></span><span class="pr-name">Some Channel Name</span><span class="pr-time">6h 51m</span><span class="pr-status err" title="yt-dlp: sign in to confirm you're not a bot">failed</span></div>
+      <div class="pr-row"><span class="pr-dot idle" aria-hidden="true"></span><span class="pr-name">Quiet Channel</span><span class="pr-time">1d</span><span class="pr-status idle">up to date</span></div>
+    </div>
+
+    <div class="comp-label">Channel card (subscribed)</div>
+    <div class="comp-grid-2">
+      <div class="card ch-card">
+        <span class="ch-select"><input type="checkbox" aria-label="Select"></span>
+        <div class="ch-top">
+          <span class="ch-avatar" aria-hidden="true">C</span>
+          <div class="ch-meta">
+            <div class="ch-name">Continuous Delivery</div>
+            <div class="ch-sub"><span class="ep-badge link">20 episodes</span><span class="ep-badge">312 MB</span><span class="poll-tag"><span class="pr-dot ok" aria-hidden="true"></span>polled 2h ago</span></div>
+          </div>
+        </div>
+        <div class="ch-actions">
+          <button class="btn btn-ghost btn-sm" type="button">Share</button>
+          <button class="btn btn-ghost btn-sm" type="button">Feed settings</button>
+          <button class="btn btn-ghost btn-sm" type="button">Poll</button>
+          <button class="btn btn-danger-ghost btn-sm" type="button">Remove</button>
+        </div>
+      </div>
+      <div class="card ch-card selected">
+        <span class="ch-select"><input type="checkbox" checked aria-label="Select"></span>
+        <div class="ch-top">
+          <span class="ch-avatar" aria-hidden="true">S</span>
+          <div class="ch-meta">
+            <div class="ch-name">Selected state example</div>
+            <div class="ch-sub"><span class="ep-badge zero">no episodes yet</span><span class="poll-tag err" title="Last poll failed"><span class="pr-dot err" aria-hidden="true"></span>poll failed</span></div>
+          </div>
+        </div>
+        <div class="ch-actions">
+          <button class="btn btn-ghost btn-sm" type="button" disabled title="Feed appears after the first successful poll">Share</button>
+          <button class="btn btn-ghost btn-sm" type="button" disabled>Feed settings</button>
+          <button class="btn btn-ghost btn-sm" type="button">Poll</button>
+          <button class="btn btn-danger-ghost btn-sm" type="button">Remove</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="comp-label">Empty state</div>
+    <div class="grid">
+      <div class="empty"><span class="empty-emoji" aria-hidden="true">📡</span><strong>No channels yet</strong><span>Paste a YouTube channel URL above to start building a podcast feed.</span></div>
+    </div>
+
+    <div class="comp-label">Cookies status card</div>
+    <div class="card cookies-card" style="max-width:520px">
+      <div class="cookies-status"><span class="dot ok"></span><span>Cookies active</span><span class="sub">expires in 12 days · updated Sep 9</span></div>
+    </div>
+    <div class="comp-row" style="margin-top:10px">
+      <div class="cookies-status"><span class="dot warn"></span><span>Cookies aging</span></div>
+      <div class="cookies-status"><span class="dot bad"></span><span>Cookies expired</span></div>
+    </div>
+
+    <div class="comp-label">Banners</div>
+    <div class="banner is-error" style="margin:0 0 10px;max-width:640px"><strong>Cookies expired Sep 1.</strong> Polls will fail until you upload a fresh cookies.txt below.</div>
+    <div class="banner is-warn" style="margin:0;max-width:640px"><strong>Cookies expire in 5 days</strong> (Sep 18). Re-upload cookies.txt to avoid failed polls.</div>
+
+    <div class="comp-label">Toasts</div>
+    <div class="comp-row" style="align-items:flex-start">
+      <div class="toast ok" style="position:static;animation:none"><span class="t-icon">✓</span><span>Added Continuous Delivery</span></div>
+      <div class="toast err" style="position:static;animation:none"><span class="t-icon">!</span><span>Poll failed — see channel card</span></div>
+      <div class="toast info" style="position:static;animation:none"><span class="t-icon">ℹ</span><span>3 jobs running</span></div>
+    </div>
+
+    <div class="comp-label">Polling gauge</div>
+    <div class="card poll-card" style="max-width:640px">
+      <div class="poll-gauge" role="img" aria-label="Time until next poll">
+        <svg viewBox="0 0 84 84" width="84" height="84" aria-hidden="true">
+          <circle class="poll-ring-bg" cx="42" cy="42" r="37" fill="none" stroke-width="6"/>
+          <circle class="poll-ring-fg" cx="42" cy="42" r="37" fill="none" stroke-width="6" stroke-linecap="round"
+                  stroke-dasharray="232.5" stroke-dashoffset="80" transform="rotate(-90 42 42)"/>
+        </svg>
+        <div class="poll-gauge-label"><span class="poll-gauge-num">1h 42m</span><span class="poll-gauge-cap">until next</span></div>
+      </div>
+      <div class="poll-info">
+        <div class="poll-title-row"><h2>Polling</h2><span class="pill">every 2h</span><span class="poll-health good">all healthy</span></div>
+        <div class="poll-facts"><strong>Last poll</strong> 18m ago</div>
+      </div>
+      <button class="btn btn-ghost btn-sm poll-now" type="button">Poll all now</button>
+    </div>
+
+    <div class="comp-label">Modal card</div>
+    <div class="card" style="max-width:360px;padding:24px;text-align:center;position:relative">
+      <button class="modal-close" type="button" aria-label="Close" style="position:absolute;top:10px;right:12px">&times;</button>
+      <h3>Share feed</h3>
+      <p class="share-name">Continuous Delivery</p>
+      <div class="share-url"><input type="text" readonly value="https://slipcast.example/feed/UC5xx.xml?token=a1b2c3"><button class="btn btn-ghost" type="button">Copy</button></div>
+      <div class="share-apps"><a class="btn btn-ghost" href="#" onclick="return false">Pocket Casts</a><a class="btn btn-ghost" href="#" onclick="return false">Apple Podcasts</a></div>
+    </div>
+
+    <div class="comp-label">Changelog entry</div>
+    <div class="cl-entry" style="max-width:480px">
+      <div class="cl-head"><span class="cl-version">v1.15.0</span><span class="cl-badge">running</span><span class="cl-date">Sep 3, 2026</span></div>
+      <ul class="cl-changes"><li>Channels now key off channel_id as their primary identity.</li></ul>
+    </div>
+  </section>
+
+  <footer class="ds-foot">Slipcast · Signal Deck design system · rendered live from <code>/static/styles.css</code> · see <code>DESIGN.md</code> in the repo root</footer>
+</div>
+</body>
+</html>
