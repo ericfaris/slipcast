@@ -1025,6 +1025,128 @@ def test_download_single_ignores_duration_cap(tmp_path, monkeypatch):
     assert len(db.get_episodes(CID)) == 1
 
 
+# --- upcoming premieres / scheduled streams ----------------------------------
+
+def test_poll_skips_upcoming_entry_without_skip_record(tmp_path, monkeypatch):
+    """An un-aired premiere is never attempted, never recorded as a skip (so it
+    downloads once it airs), and doesn't take a slot in the newest-N window."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 2)
+    url = "https://www.youtube.com/@SomeChannel"
+    db.add_channel(url)
+
+    entries = [
+        {"id": "v000", "availability": None, "live_status": "is_upcoming"},
+        {"id": "v001", "availability": None},
+        {"id": "v002", "availability": None},
+    ]
+    downloaded_ids = _stub_poll_io(monkeypatch, entries)
+
+    result = downloader.poll_channel(url)
+
+    assert downloaded_ids == ["v001", "v002"]
+    assert "v000" not in db.get_skip_video_ids(CID)
+    assert result["failures"] == []
+
+
+def test_poll_upcoming_error_is_not_a_failure(tmp_path, monkeypatch):
+    """Backstop: a listing without live_status reaches the download, which
+    raises UpcomingError — no failure, no alert, no skip, no slot used."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 1)
+    url = "https://www.youtube.com/@SomeChannel"
+    db.add_channel(url)
+
+    entries = [{"id": "v000", "availability": None},
+               {"id": "v001", "availability": None}]
+    attempted = []
+
+    def _fake_download(entry, cid, cname, **_kw):
+        attempted.append(entry["id"])
+        if entry["id"] == "v000":
+            raise downloader.UpcomingError("v000")
+        return _ep(1, cid)
+
+    alerts = []
+    monkeypatch.setattr(downloader, "_fetch_channel_entries",
+                        lambda *a, **k: (entries, CID, "C"))
+    monkeypatch.setattr(downloader, "_download_entry", _fake_download)
+    monkeypatch.setattr(downloader, "valid_cookie_file", lambda _p: True)
+    monkeypatch.setattr(downloader.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(downloader.notify, "send_cookie_alert",
+                        lambda *a, **k: alerts.append("cookie"))
+
+    result = downloader.poll_channel(url)
+
+    assert attempted == ["v000", "v001"]
+    assert result["failures"] == []
+    assert result["downloaded"] == 1
+    assert alerts == []
+    assert "v000" not in db.get_skip_video_ids(CID)
+
+
+def test_download_entry_raises_upcoming_for_premiere(tmp_path, monkeypatch):
+    """The real _download_entry maps yt-dlp's 'Premieres in N hours' to
+    UpcomingError, not a members-only skip or a silent None."""
+    _setup_tmp(tmp_path, monkeypatch)
+
+    class _PremiereYDL:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, *a, **k):
+            raise downloader.yt_dlp.utils.DownloadError(
+                "ERROR: [youtube] vAAAAAAAAAA: Premieres in 35 hours")
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", lambda *a, **k: _PremiereYDL())
+
+    try:
+        downloader._download_entry({"id": "vAAAAAAAAAA"}, CID, "C")
+        assert False, "expected UpcomingError"
+    except downloader.UpcomingError:
+        pass
+
+
+def test_looks_like_upcoming():
+    assert downloader._looks_like_upcoming("ERROR: [youtube] x: Premieres in 35 hours")
+    assert downloader._looks_like_upcoming("This live event will begin in 3 days.")
+    assert not downloader._looks_like_upcoming("Video unavailable")
+    assert not downloader._looks_like_upcoming("Join this channel to get access")
+    assert not downloader._looks_like_upcoming("")
+
+
+def test_poll_still_records_members_only_and_too_long_skips(tmp_path, monkeypatch):
+    """Regression: the upcoming path must not swallow the permanent skips."""
+    _setup_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+    url = "https://www.youtube.com/@SomeChannel"
+    db.add_channel(url)
+
+    entries = [
+        {"id": "v000", "availability": "subscriber_only"},
+        {"id": "v001", "availability": None, "duration": 7200},
+        {"id": "v002", "availability": None, "live_status": "is_upcoming"},
+    ]
+    _stub_poll_io(monkeypatch, entries)
+
+    downloader.poll_channel(url)
+
+    skipped = db.get_skip_video_ids(CID)
+    assert {"v000", "v001"} <= skipped
+    assert "v002" not in skipped
+
+
+def test_ydl_opts_route_ytdlp_output_through_logging(tmp_path, monkeypatch):
+    """yt-dlp's own 'ERROR:' lines must go to Python logging, not raw stderr."""
+    _setup_tmp(tmp_path, monkeypatch)
+    opts = downloader._ydl_opts(CID)
+    assert isinstance(opts["logger"], downloader._YdlLogger)
+
+
 # --- explicit episode re-download -------------------------------------------
 
 VID = "vAAAAAAAAAA"  # 11 chars — a valid video_id per the regex

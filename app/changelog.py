@@ -8,6 +8,14 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.15.1",
+        "date": "2026-10-01",
+        "changes": [
+            "Scheduled YouTube premieres and live streams that haven't aired yet are now skipped quietly during polls instead of being attempted (and logged as an error) every cycle. They aren't remembered as skipped, so the first poll after they air downloads them normally, and while they're pending they no longer use up one of the channel's episode slots.",
+            "yt-dlp's own console output now goes through the app's logging instead of printing raw 'ERROR:' lines for problems the app already handles and reports itself.",
+        ],
+    },
+    {
         "version": "1.15.0",
         "date": "2026-09-03",
         "changes": [

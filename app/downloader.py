@@ -110,7 +110,49 @@ class TooLongError(Exception):
     """Raised when a video exceeds MAX_EPISODE_DURATION_MINUTES."""
 
 
+# A scheduled premiere or live stream sits in the channel's /videos listing
+# before it airs, and yt-dlp refuses it with one of these. It's not a failure
+# and must never be remembered as a skip — it becomes downloadable on its own.
+_UPCOMING_SIGNALS = (
+    "premieres in",
+    "premiere will begin",
+    "this live event will begin",
+    "is_upcoming",
+)
+
+
+def _looks_like_upcoming(message: str) -> bool:
+    m = (message or "").lower()
+    return any(sig in m for sig in _UPCOMING_SIGNALS)
+
+
+class UpcomingError(Exception):
+    """Raised when a video is a premiere/live stream that hasn't aired yet."""
+
+
 logger = logging.getLogger(__name__)
+
+
+class _YdlLogger:
+    """Route yt-dlp's own output through Python logging instead of bare stderr.
+
+    yt-dlp prints an "ERROR: ..." line to stderr for every DownloadError even
+    with quiet=True, including expected, already-handled conditions like an
+    upcoming premiere. Every such error is raised to our code, which logs it
+    with context at the level it deserves, so yt-dlp's copy only goes to debug.
+    """
+
+    def debug(self, msg):
+        logger.debug("yt-dlp: %s", msg)
+
+    def info(self, msg):
+        logger.debug("yt-dlp: %s", msg)
+
+    def warning(self, msg):
+        logger.debug("yt-dlp: %s", msg)
+
+    def error(self, msg):
+        logger.debug("yt-dlp: %s", msg)
 
 # yt-dlp's FFmpegExtractAudio postprocessor maps each preferredcodec to a fixed
 # output extension (see ACODECS in yt_dlp/postprocessor/ffmpeg.py): "mp3" ->
@@ -323,6 +365,7 @@ def _base_ydl_opts() -> dict:
         "no_warnings": True,
         "js_runtimes": {"node": {}},
         "socket_timeout": 30,
+        "logger": _YdlLogger(),
     }
     if valid_cookie_file(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
@@ -424,6 +467,10 @@ def _download_entry(entry: dict, channel_id: str, channel_name: str, *,
         if _looks_like_member_only(str(exc)):
             # Let the caller decide whether to remember/skip this one.
             raise MemberOnlyError(video_id) from exc
+        if _looks_like_upcoming(str(exc)):
+            # Backstop for listings that don't carry live_status.
+            logger.info("Not yet available (upcoming premiere/stream): %s", video_id)
+            raise UpcomingError(video_id) from exc
         logger.warning("Failed to download %s: %s", video_id, exc)
         return None
 
@@ -685,6 +732,12 @@ def _poll_channel_locked(channel_url: str):
                 if video_id:
                     db.add_skip_video(video_id, channel_id, "members_only")
                 continue
+            if entry.get("live_status") == "is_upcoming":
+                # A premiere/scheduled stream that hasn't aired. No skip record:
+                # the next poll after it airs should pick it up normally. It
+                # doesn't count toward the cap either.
+                logger.info("Skipping upcoming premiere/stream: %s", video_id)
+                continue
             if _exceeds_duration_cap(entry.get("duration")):
                 logger.debug("Skipping over-long video: %s", video_id)
                 if video_id:
@@ -706,6 +759,10 @@ def _poll_channel_locked(channel_url: str):
                 # Recorded so future polls skip it before spending the download.
                 if video_id:
                     db.add_skip_video(video_id, channel_id, "too_long")
+                considered -= 1
+                continue
+            except UpcomingError:
+                # Not aired yet — retry next poll, never record a skip.
                 considered -= 1
                 continue
             except Exception as exc:  # noqa: BLE001
@@ -935,6 +992,9 @@ def download_single(video_url: str, subscribe: bool = False):
         # just report that membership is required.
         logger.warning("Cannot download members-only video without membership: %s", video_url)
         return
+    except UpcomingError:
+        logger.warning("Cannot download %s yet — it hasn't premiered/aired", video_url)
+        return
     if result:
         db.upsert_episode(result)
         logger.info("Downloaded single video: %s", result["title"])
@@ -1011,6 +1071,9 @@ def redownload_episode(video_id: str, channel_id: str, channel_name: str) -> dic
         return None
     except TooLongError:
         logger.warning("Cannot re-download %s — exceeds the duration cap", video_id)
+        return None
+    except UpcomingError:
+        logger.warning("Cannot re-download %s — it hasn't premiered/aired yet", video_id)
         return None
 
 
