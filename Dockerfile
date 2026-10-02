@@ -14,6 +14,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
+# One-off maintenance scripts (e.g. scripts/migrate_to_r2.py), run with
+# `docker compose exec app python scripts/<name>.py`. Not wired into the app.
+COPY scripts/ ./scripts/
 
 ENV DATA_DIR=/data
 

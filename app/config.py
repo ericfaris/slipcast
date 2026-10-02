@@ -33,8 +33,28 @@ POLL_CONCURRENCY = int(os.environ.get("POLL_CONCURRENCY", "2"))
 # caps each channel individually but nothing accounts for the size of the volume
 # they all share. When free space on the DATA_DIR filesystem drops below this many
 # GB, poll_all() prunes the globally oldest episodes (across channels) before
-# downloading anything more. Set to 0 to disable the check entirely.
+# downloading anything more. Set to 0 to disable the check entirely. Ignored
+# when STORAGE=r2: media then lives in the R2 bucket, not on this disk, and the
+# per-channel count/age caps still bound it.
 MIN_FREE_DISK_GB = int(os.environ.get("MIN_FREE_DISK_GB", "2"))
+
+# --- Media storage -------------------------------------------------------------
+# Where audio + thumbnails live: STORAGE=local (DATA_DIR/audio, DATA_DIR/thumbnails,
+# the default) or STORAGE=r2 (a private Cloudflare R2 bucket). STORAGE and the
+# R2_* credentials are deliberately NOT read here — app/storage.py reads them
+# straight from the environment, so secrets never sit in an importable module
+# attribute. Only the non-secret tuning knobs live here.
+#
+# Per-download temp dirs (r2 mode only): yt-dlp writes here, only the finished
+# file is uploaded, and the dir is removed afterwards. Blank means
+# <tempdir>/slipcast-staging. Must never point at DATA_DIR or its media dirs.
+STORAGE_STAGING_DIR = os.environ.get("STORAGE_STAGING_DIR", "").strip()
+# How often the in-memory index of bucket objects is rebuilt with ListObjectsV2
+# (picks up out-of-process changes such as the migration script's uploads).
+STORAGE_INDEX_REFRESH_MINUTES = int(os.environ.get("STORAGE_INDEX_REFRESH_MINUTES", "10"))
+# Lifetime of the presigned URL /audio and /thumbnails redirect to in r2 mode.
+# Podcast apps follow the redirect immediately, so an hour is plenty.
+PRESIGN_EXPIRY_SECONDS = int(os.environ.get("PRESIGN_EXPIRY_SECONDS", "3600"))
 
 # --- Email alerts (cookie expiry / invalid cookies) ---------------------------
 # Configure SMTP to receive an email when the cookies file needs to be re-uploaded.

@@ -79,11 +79,11 @@ All configuration is via environment variables in `docker-compose.yml`. Credenti
 | `AUTH_USER` | *(none)* | Management UI username (single-user; ignored if `AUTH_USERS` is set) |
 | `AUTH_PASS` | *(none)* | Management UI password (single-user; ignored if `AUTH_USERS` is set) |
 | `AUTH_USERS` | *(none)* | Multi-user credentials, e.g. `alice:pass1,bob:pass2` — takes precedence over `AUTH_USER`/`AUTH_PASS` |
-| `DATA_DIR` | `/data` | Where audio, thumbnails, and the database are stored |
+| `DATA_DIR` | `/data` | Where the database, cookies and backups are stored — plus audio and thumbnails when `STORAGE=local` |
 | `MAX_EPISODES_PER_CHANNEL` | `20` | How many episodes to keep per channel |
 | `MAX_EPISODE_AGE_DAYS` | `0` (disabled) | Also prune episodes older than this many days, in addition to the count cap above |
 | `MAX_EPISODE_DURATION_MINUTES` | `0` (disabled) | Don't download channel videos longer than this many minutes (one-off downloads are exempt — see "Important notes") |
-| `MIN_FREE_DISK_GB` | `2` | Below this many GB free on the `DATA_DIR` filesystem, the globally oldest episodes are deleted before polling (`0` disables); always emails what it removed |
+| `MIN_FREE_DISK_GB` | `2` | Below this many GB free on the `DATA_DIR` filesystem, the globally oldest episodes are deleted before polling (`0` disables); always emails what it removed. Ignored when `STORAGE=r2` |
 | `POLL_INTERVAL_HOURS` | `2` | How often to check subscribed channels for new videos |
 | `POLL_CONCURRENCY` | `2` | Max channels polled at once by "poll all"/"poll selected" |
 | `REQUIRE_FEED_TOKENS` | `false` | Require `?token=<feed_token>` on every feed request (see "Feed access tokens") — off by default so existing podcast-app subscriptions keep working |
@@ -97,6 +97,11 @@ All configuration is via environment variables in `docker-compose.yml`. Credenti
 | `SMTP_PASS` | *(none)* | SMTP password (for Gmail, an [App Password](https://myaccount.google.com/apppasswords)) |
 | `SMTP_FROM` | `SMTP_USER` | From address for alert emails |
 | `ALERT_EMAIL` | `ericfaris@gmail.com` | Where cookie-expiry and poll-failure alerts are sent |
+| `STORAGE` | `local` (compose: `r2`) | Where audio + thumbnails live: `local` (under `DATA_DIR`) or `r2` (private Cloudflare R2 bucket). Anything else refuses to start — see "Media storage" |
+| `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET` | *(none)* | R2 account and bucket-scoped API token; all four required when `STORAGE=r2`. Keep them in `.env`, never logged |
+| `STORAGE_STAGING_DIR` | `<tmp>/slipcast-staging` | Per-download temp dirs in r2 mode (only the finished file is uploaded). Must not be `DATA_DIR` or inside it |
+| `STORAGE_INDEX_REFRESH_MINUTES` | `10` | How often the in-memory index of bucket objects is rebuilt (r2 mode) |
+| `PRESIGN_EXPIRY_SECONDS` | `3600` | Lifetime of the presigned URL that `/audio` and `/thumbnails` redirect to (r2 mode) |
 
 ### Important notes
 - ⚠️ **Always set credentials before exposing the app.** If neither `AUTH_USERS` nor `AUTH_USER`/`AUTH_PASS` is set, authentication is **disabled** and the entire management UI — including channel management and cookie upload — is open to anyone who can reach it. Set `AUTH_USERS=alice:pass1,bob:pass2` (preferred) or `AUTH_USER`/`AUTH_PASS` whenever the app is reachable beyond localhost.
@@ -235,9 +240,9 @@ Tokens are generated for every channel as soon as you upgrade, regardless of whe
 | `GET` | `/` | Required | Management UI |
 | `GET` | `/feed/<channel_id>.xml` | None | RSS feed for a channel (accepts an optional `?token=` — required when `REQUIRE_FEED_TOKENS=true`) |
 | `GET` | `/feed/all.xml` | None | Combined RSS feed across all subscribed channels, newest first, capped at `ALL_FEED_MAX_EPISODES` (same optional `?token=`) |
-| `GET` | `/audio/<channel_id>/<file>` | None | Audio file stream (extension depends on `AUDIO_CODEC` — `.mp3` or `.opus`) |
-| `GET` | `/thumbnails/<channel_id>/<file>.jpg` | None | Thumbnail image |
-| `GET` | `/health` | None | Full health report — 200 `{"status":"ok",...}` when healthy, 503 `{"status":"degraded",...}` (with a `checks`/`problems` breakdown) if the scheduler isn't running, polling has gone stale (no run in ~3x `POLL_INTERVAL_HOURS`, past an initial startup grace period), or cookies are missing/expired. This is the one to read yourself; automation should use `/health/live` |
+| `GET` | `/audio/<channel_id>/<file>` | None | Audio file stream (extension depends on `AUDIO_CODEC` — `.mp3` or `.opus`), or a 302 to a presigned R2 URL in r2 mode |
+| `GET` | `/thumbnails/<channel_id>/<file>.jpg` | None | Thumbnail image, or a 302 to a presigned R2 URL in r2 mode |
+| `GET` | `/health` | None | Full health report — 200 `{"status":"ok",...}` when healthy, 503 `{"status":"degraded",...}` (with a `checks`/`problems` breakdown) if the scheduler isn't running, polling has gone stale (no run in ~3x `POLL_INTERVAL_HOURS`, past an initial startup grace period), or cookies are missing/expired. `checks.storage` reports media storage (`local`, `r2 ok`, `r2 unavailable` — the last also makes it 503). This is the one to read yourself; automation should use `/health/live` |
 | `GET` | `/health/live` | None | Liveness check — the same report **minus** the cookie check: 200 only when a restart would plausibly help (scheduler running, polling not stalled). Expired cookies and low disk deliberately do **not** fail it, since restarting fixes neither. This is what the Docker healthcheck and [ops/autoheal.sh](ops/README.md) watch |
 | `GET` | `/add?channel=<url>` | Required | Add a channel via shareable link |
 | `GET` | `/download?url=<url>` | Required | Download an episode via shareable link |
@@ -259,11 +264,11 @@ Tokens are generated for every channel as soon as you upgrade, regardless of whe
 
 1. **Polling** — on startup and every `POLL_INTERVAL_HOURS`, yt-dlp fetches the `/videos` tab of each subscribed channel
 2. **Filtering** — member-only, subscriber-only, and premium videos are skipped during automatic polls, as is anything longer than `MAX_EPISODE_DURATION_MINUTES` (when set)
-3. **Downloading** — new videos are downloaded as MP3 (128 kbps by default — see `AUDIO_CODEC`/`AUDIO_BITRATE_KBPS`) to `DATA_DIR/audio/<channel_id>/`
+3. **Downloading** — new videos are downloaded as MP3 (128 kbps by default — see `AUDIO_CODEC`/`AUDIO_BITRATE_KBPS`) to `DATA_DIR/audio/<channel_id>/`, or, with `STORAGE=r2`, into a temp staging dir and then uploaded to `audio/<channel_id>/` in the R2 bucket
 4. **Thumbnails** — channel cover art and per-episode thumbnails are downloaded and converted to JPEG (YouTube often serves WebP; ffmpeg converts them for podcast app compatibility)
 5. **Pruning** — once a channel exceeds `MAX_EPISODES_PER_CHANNEL`, or an episode exceeds `MAX_EPISODE_AGE_DAYS` (when set), it's deleted. Separately, if free disk falls below `MIN_FREE_DISK_GB`, the oldest episodes **across all channels** are deleted at the start of a poll until it's back above the line (you get an email listing them)
 6. **Feed generation** — RSS feeds are built dynamically from the SQLite database on each request
-7. **Deduplication** — already-downloaded files are skipped by file existence check
+7. **Deduplication** — already-downloaded files are skipped by file existence check (in r2 mode, against the in-memory bucket index)
 
 ---
 
@@ -330,6 +335,44 @@ the new schema's `NOT NULL` on `channel_id` — so an older image pointed at a
 migrated database will fail to add channels. Restore the snapshot with the
 procedure above *and* run the previous image; doing only one of the two is not a
 working rollback.
+
+---
+
+## Media storage
+
+Audio and thumbnails live in one of two places, chosen by `STORAGE`:
+
+- **`local`** (the app default) — under `DATA_DIR/audio/` and `DATA_DIR/thumbnails/`, exactly as shown above.
+- **`r2`** (the `docker-compose.yml` default) — in a private Cloudflare R2 bucket (`slipcast-media`). Keys mirror the directory layout: `audio/<channel_id>/<video_id>.mp3|opus`, `thumbnails/<channel_id>/<video_id>.jpg`, `thumbnails/<channel_id>/channel.jpg`. The database, cookies and local backups stay on `./data`.
+
+Nothing persisted differs between the modes — episode rows store plain filenames — so switching is just changing `STORAGE` and restarting.
+
+In r2 mode:
+
+- **URLs are unchanged.** `/audio/...` and `/thumbnails/...` answer with a `302` to a presigned R2 URL (1 hour by default, `PRESIGN_EXPIRY_SECONDS`, `Cache-Control: private, no-store`), so R2 serves the bytes and Range requests. Podcast apps follow the redirect transparently. A missing or unsafe path is `404`; if the bucket can't be listed it's `503` with `Retry-After`.
+- **Existence and sizes come from an in-memory index** built by paginated `ListObjectsV2` at startup and every `STORAGE_INDEX_REFRESH_MINUTES`, updated in place on the app's own uploads/deletes — never a per-object HEAD. If the index can't load, polls are skipped (with a poll-failure email) rather than treating every episode as missing.
+- **Downloads stage locally**: yt-dlp writes into a per-download temp dir (`STORAGE_STAGING_DIR`), only the finished file is uploaded, and the dir is always removed. Nothing is written under `DATA_DIR/audio` or `DATA_DIR/thumbnails`.
+- **`MIN_FREE_DISK_GB` is ignored** — the media isn't on this disk. The per-channel count/age caps still prune.
+- **Backups are mirrored**: the nightly DB snapshot is also uploaded to `backups/` in the bucket, with the same 7-copy retention (the `pre-pk-migration-*` snapshot isn't uploaded).
+- **Fail fast**: if `STORAGE=r2` and any `R2_*` variable is missing (or `STORAGE` is anything other than `local`/`r2`), the app refuses to start and the log names the missing variables — never their values.
+- `/health` reports `checks.storage`; `/api/state` (authed) includes the bucket, index status and object count.
+
+### Migrating an existing library to R2
+
+Do these in order — compose defaults to `STORAGE=r2`, and flipping to r2 before the library is uploaded makes every existing episode look missing (polls would re-download them).
+
+1. Put the `R2_*` values in `.env` **and set `STORAGE=local`**.
+2. Deploy (`docker compose build && docker compose up -d`).
+3. Dry run, then apply, inside the container:
+   ```bash
+   docker compose exec app python scripts/migrate_to_r2.py           # plan only, writes nothing
+   docker compose exec app python scripts/migrate_to_r2.py --apply   # upload + verify
+   ```
+   Confirm the summary ends with `verify mismatches: 0` (re-running is safe — already-uploaded files are skipped).
+4. Set `STORAGE=r2` in `.env` and run `docker compose up -d`.
+5. Keep `data/audio` and `data/thumbnails` until you decide to delete them yourself — the script never deletes anything.
+
+**Rollback:** set `STORAGE=local` and restart. Files still on disk are served as before; anything downloaded while in r2 mode exists only in the bucket and will look missing locally until re-downloaded.
 
 ---
 

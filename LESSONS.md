@@ -1,0 +1,14 @@
+# Lessons learned
+
+## 2026-10-02 — R2 media storage (v1.16.0)
+
+- `app/storage.py` ports bookhunt's `src/storage.js` pattern (local|r2 behind one interface, lazy SDK import, in-memory ListObjectsV2 index, fail-fast config). Callers pass their *own* module's `AUDIO_DIR`/`THUMBNAIL_DIR` into `storage.media_ref(...)` so the many existing tests that monkeypatch `downloader.AUDIO_DIR` / `main.THUMBNAIL_DIR` / `feed.THUMBNAIL_DIR` keep working. Don't move the roots into the storage module, and don't remove those module globals (monkeypatch raises if they vanish).
+- Always `storage.get()` per operation; never capture the driver at import time — tests swap drivers per test.
+- Tests: `tests/conftest.py` pins `STORAGE=local` and pops `R2_*` *before any app import* (`app.main` initialises storage at import), and an autouse fixture patches `storage._build_client` to raise, so no test can ever build a real S3 client. `.env` holds production R2 creds. Use the `fake_r2` fixture (`tests/fake_s3.py`) for r2 behaviour.
+- The unloaded index fails *closed* for download/delete decisions (`StorageUnavailable`), and `poll_all` skips the run if it can't load. Returning "missing" on a list failure would re-download the whole library. Only cosmetic checks (channel art) swallow `StorageError`.
+- Index thread-safety: hold `_lock` only for dict ops, never across network calls; `_refresh_lock` serialises refreshes; puts/deletes made while a list is in flight are queued in `_pending` and replayed onto the new index, or the older list result would erase them.
+- Serving in r2 mode is a 302 to a presigned URL. HEAD needs a `head_object` presign — a presigned GET signature is invalid for HEAD. `Cache-Control: private, no-store` so nothing caches the redirect past expiry. Local mode still delegates to `StaticFiles` (Range/304 unchanged).
+- botocore error messages can embed the endpoint URL (= account id). Every client call is wrapped and re-raised as a scrubbed `StorageError ... from None`. boto3 `Config` must set `connect_timeout`/`read_timeout` (v1.10.0 lesson) and `request_checksum_calculation`/`response_checksum_validation="when_required"` (R2 rejects the new default CRC headers).
+- No TestClient in CI (no httpx): serving tests drive `main.app` as raw ASGI with `asyncio.run`.
+- Deploy gotcha: compose defaults `STORAGE=${STORAGE:-r2}`, so `.env` must set `STORAGE=local` before the first deploy of this version, until `scripts/migrate_to_r2.py --apply` has run clean. Flipping to r2 early makes every episode look missing and polls re-download them.
+- Pre-existing race (kept for parity, not fixed): `download_single` / `redownload_episode` don't take the per-channel poll lock, so a concurrent sweep of the same channel can delete a just-stored file before its DB row is written — in both modes.

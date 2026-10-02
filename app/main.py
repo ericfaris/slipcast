@@ -18,16 +18,18 @@ from apscheduler.events import EVENT_JOB_ERROR
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from app import changelog
 from app import database as db
 from app import jobs
 from app import notify
+from app import storage
 from app.safety import is_safe_media_name
 from app.config import (
     AUDIO_DIR, ALERT_EMAIL, ALL_FEED_MAX_EPISODES, AUTH_CREDENTIALS, BASE_URL,
     COOKIES_FILE, POLL_CONCURRENCY, POLL_INTERVAL_HOURS, REQUIRE_FEED_TOKENS,
-    THUMBNAIL_DIR,
+    STORAGE_INDEX_REFRESH_MINUTES, THUMBNAIL_DIR,
 )
 from app.downloader import (
     cookies_status, delete_episode_files, download_single, find_orphan_channels,
@@ -113,6 +115,16 @@ async def lifespan(app: FastAPI):
     # reads a live WAL database safely, so overlapping a poll is harmless.
     _scheduler.add_job(db.run_backup_job, "cron", hour=3, coalesce=True,
                        misfire_grace_time=3600, max_instances=1)
+    media = storage.get()
+    if media.mode != "local":
+        # Clear dl-* dirs a crashed download left behind, and keep the object
+        # index fresh so out-of-process changes (the migration script) show up.
+        swept = storage.sweep_staging(media.staging_root)
+        if swept:
+            logger.info("Removed %d stale staging dir(s)", swept)
+        _scheduler.add_job(storage.refresh_index_job, "interval",
+                           minutes=STORAGE_INDEX_REFRESH_MINUTES,
+                           coalesce=True, max_instances=1)
     _scheduler.add_listener(_on_job_error, EVENT_JOB_ERROR)
     _scheduler.start()
 
@@ -123,11 +135,27 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("No channels configured — add one at %s", BASE_URL)
 
-    # Report-only: log any channel data (episodes/files) with no owning row,
-    # so it's at least visible in the logs even before anyone opens the
-    # dashboard. Never auto-delete at startup — this is the user's data; the
-    # dashboard's orphan section and /channels/remove-orphan are how it's
-    # actually cleaned up, on purpose, by a person.
+    if media.mode == "local":
+        _report_orphans()
+    else:
+        # The first index load is a network round trip — keep it (and the
+        # orphan report that needs it) off the event loop. The initial poll
+        # above is safe to start meanwhile: its readiness gate waits on the
+        # same serialised first load.
+        threading.Thread(target=_warm_media_index, daemon=True).start()
+
+    yield
+
+    _scheduler.shutdown()
+    _poll_executor.shutdown(wait=False)
+
+
+def _report_orphans() -> None:
+    """Report-only: log any channel data (episodes/files) with no owning row,
+    so it's at least visible in the logs even before anyone opens the
+    dashboard. Never auto-delete at startup — this is the user's data; the
+    dashboard's orphan section and /channels/remove-orphan are how it's
+    actually cleaned up, on purpose, by a person."""
     try:
         orphans = find_orphan_channels()
         for o in orphans:
@@ -142,10 +170,15 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001 — reconciliation must never block startup
         logger.exception("Orphan reconciliation failed")
 
-    yield
 
-    _scheduler.shutdown()
-    _poll_executor.shutdown(wait=False)
+def _warm_media_index() -> None:
+    if storage.get().ensure_index():
+        logger.info("Media storage index loaded (%d object(s))",
+                    storage.get().health_info().get("object_count", 0))
+        _report_orphans()
+    else:
+        logger.error("Media storage (R2) index could not be loaded at startup — "
+                     "will retry on demand and every %d min", STORAGE_INDEX_REFRESH_MINUTES)
 
 
 app = FastAPI(title="Slipcast", lifespan=lifespan)
@@ -305,10 +338,92 @@ async def auth_middleware(request: Request, call_next):
     _record_failure(ip, request)
     return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Slipcast"'})
 
-os.makedirs(AUDIO_DIR, exist_ok=True)
-os.makedirs(THUMBNAIL_DIR, exist_ok=True)
-app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
-app.mount("/thumbnails", StaticFiles(directory=THUMBNAIL_DIR), name="thumbnails")
+# Fail fast: a bad STORAGE / missing R2_* means uvicorn can't even import the
+# app — the most unmissable failure there is, and far better than silently
+# writing media into the container's ephemeral filesystem. The error names the
+# missing variables, never their values.
+try:
+    _media_store = storage.init()
+except storage.StorageConfigError as exc:
+    logger.critical("Storage misconfigured: %s", exc)
+    raise SystemExit(1)
+if _media_store.mode == "local":
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    os.makedirs(THUMBNAIL_DIR, exist_ok=True)
+
+
+def _relative_media_path(scope) -> str:
+    """The path below the mount point, as StaticFiles computes it."""
+    path = scope["path"]
+    root_path = scope.get("root_path", "")
+    if root_path and path.startswith(root_path) and path != root_path \
+            and path[len(root_path)] == "/":
+        return path[len(root_path):]
+    return path
+
+
+class _MediaFiles:
+    """/audio and /thumbnails, in either storage mode, at unchanged URLs.
+
+    local: delegates to StaticFiles on the directory current at request time
+    (main.AUDIO_DIR/THUMBNAIL_DIR), so Range/206, HEAD, ETag/304 and
+    content-type are byte-identical to the old plain mounts.
+
+    r2: a 302 to a short-lived presigned URL, so R2 carries the bandwidth and
+    Range traffic. Existence comes from the in-memory index (no per-object
+    HEAD); 404 when missing or the path is unsafe, 503 + Retry-After when the
+    index can't load. Presigned URLs are never logged.
+    """
+
+    def __init__(self, kind: str, dir_getter):
+        self.kind = kind
+        self._dir = dir_getter
+        self._static: dict[str, StaticFiles] = {}
+
+    async def __call__(self, scope, receive, send):
+        drv = storage.get()
+        if drv.mode == "local":
+            d = self._dir()
+            static = self._static.get(d) or self._static.setdefault(
+                d, StaticFiles(directory=d, check_dir=False))
+            return await static(scope, receive, send)
+
+        method = scope.get("method", "GET").upper()
+        if method not in ("GET", "HEAD"):
+            response = Response("Method Not Allowed", status_code=405,
+                                headers={"Allow": "GET, HEAD"})
+            return await response(scope, receive, send)
+
+        parts = _relative_media_path(scope).split("/")
+        ref = None
+        if len(parts) == 3 and parts[0] == "":
+            try:
+                ref = storage.media_ref(self.kind, self._dir(), parts[1], parts[2])
+            except ValueError:
+                ref = None
+        if ref is None:
+            return await Response("Not Found", status_code=404)(scope, receive, send)
+
+        try:
+            # May do network I/O on a cold index — keep it off the event loop.
+            found = await run_in_threadpool(drv.exists, ref)
+            if found:
+                location = await run_in_threadpool(drv.presigned_url, ref, method)
+        except storage.StorageError:
+            response = Response("Media storage temporarily unavailable", status_code=503,
+                                headers={"Retry-After": "30"})
+            return await response(scope, receive, send)
+        if not found:
+            return await Response("Not Found", status_code=404)(scope, receive, send)
+        # no-store: neither the tunnel nor a client cache may keep a redirect
+        # past the presigned URL's expiry.
+        response = RedirectResponse(location, status_code=302,
+                                    headers={"Cache-Control": "private, no-store"})
+        return await response(scope, receive, send)
+
+
+app.mount("/audio", _MediaFiles("audio", lambda: AUDIO_DIR), name="audio")
+app.mount("/thumbnails", _MediaFiles("thumbnails", lambda: THUMBNAIL_DIR), name="thumbnails")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -413,7 +528,13 @@ def _token_ok(expected: str | None, provided: str | None) -> bool:
 
 
 def _channel_thumb_exists(channel_id: str) -> bool:
-    return bool(channel_id) and os.path.exists(os.path.join(THUMBNAIL_DIR, channel_id, "channel.jpg"))
+    if not channel_id:
+        return False
+    try:
+        return storage.get().exists(
+            storage.media_ref("thumbnails", THUMBNAIL_DIR, channel_id, "channel.jpg"))
+    except (ValueError, storage.StorageError):
+        return False  # cosmetic: no art rather than a broken dashboard
 
 
 def _thumb_url(channel_id: str) -> str | None:
@@ -862,6 +983,9 @@ def api_state():
         "jobs": jobs.snapshot(),
         "all_feed_url": _all_feed_url(),
         "version": VERSION,
+        # Cached driver state only (no I/O). In r2 mode: bucket, index status,
+        # object count and the last (secret-scrubbed) error. Authed endpoint.
+        "storage": storage.get().health_info(),
     })
 
 
@@ -1300,12 +1424,31 @@ def health():
     else:
         checks["cookies"] = "ok"
 
+    # Media storage, from the driver's cached state (never a network call
+    # here). /health has never had a disk check — the only disk logic is
+    # downloader._enforce_disk_floor, which r2 mode skips — so there's nothing
+    # disk-related to adapt. This is a public endpoint: mode/ok/time only, no
+    # bucket name, error text or counts.
+    sinfo = storage.get().health_info()
+    if sinfo["mode"] == "local":
+        checks["storage"] = "local"
+    elif sinfo["ok"]:
+        checks["storage"] = "r2 ok"
+    elif not sinfo.get("index_loaded") and not sinfo.get("last_error"):
+        # First index load still in flight right after startup.
+        checks["storage"] = "r2 starting up"
+    else:
+        checks["storage"] = "r2 unavailable"
+        problems.append("media storage (R2) is unreachable")
+
     ok = not problems
     body = {
         "status": "ok" if ok else "degraded",
         "version": VERSION,
         "checks": checks,
         "problems": problems,
+        "storage": {"mode": sinfo["mode"], "ok": sinfo["ok"],
+                    "last_refresh_at": sinfo.get("last_refresh_at")},
     }
     return JSONResponse(body, status_code=200 if ok else 503)
 
