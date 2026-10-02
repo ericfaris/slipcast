@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from app import notify
+from app import storage
 from app.config import BACKUP_DIR, DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -879,6 +880,21 @@ def run_backup_job() -> None:
         if deleted:
             logger.info("Pruned %d old backup(s), keeping the newest %d",
                         len(deleted), _BACKUP_RETAIN)
+
+        # In r2 mode, also keep an off-host copy: the DB stays on the local
+        # volume, so without this a lost disk would take the metadata with it.
+        # A failed upload is reported but never undoes the local backup.
+        drv = storage.get()
+        if drv.mode == "r2":
+            try:
+                drv.put_backup(path)                         # key backups/<basename>
+                gone = drv.prune_backups(_BACKUP_RETAIN)     # only backups/episodes-*.db
+                logger.info("Database backup mirrored to R2 (%d old remote copy/copies pruned)",
+                            len(gone))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Database backup R2 upload failed: %s", exc)
+                notify.send_backup_failure_alert(
+                    f"backup saved locally but R2 upload failed: {exc}")
     except Exception as exc:  # noqa: BLE001 — a scheduled job must never
         # crash silently; that class of failure is exactly what this pass exists
         # to eliminate.

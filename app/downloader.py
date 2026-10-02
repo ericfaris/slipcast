@@ -13,6 +13,7 @@ import yt_dlp
 
 from app import database as db
 from app import notify
+from app import storage
 from app.safety import is_safe_media_name
 from app.config import (
     AUDIO_BITRATE_KBPS,
@@ -218,11 +219,15 @@ def _download_thumbnail(url: str, dest: str) -> bool:
         return False
 
 
+# Both still validate and return the channel's local directory in every mode,
+# but only create it in local mode: with STORAGE=r2 nothing is ever written
+# under DATA_DIR/audio or DATA_DIR/thumbnails.
 def _thumbnail_dir_for(channel_id: str) -> str:
     if not _CHANNEL_ID_RE.match(channel_id):
         raise ValueError(f"Invalid channel_id: {channel_id!r}")
     path = os.path.join(THUMBNAIL_DIR, channel_id)
-    os.makedirs(path, exist_ok=True)
+    if storage.get().mode == "local":
+        os.makedirs(path, exist_ok=True)
     return path
 
 
@@ -230,8 +235,54 @@ def _audio_dir_for(channel_id: str) -> str:
     if not _CHANNEL_ID_RE.match(channel_id):
         raise ValueError(f"Invalid channel_id: {channel_id!r}")
     path = os.path.join(AUDIO_DIR, channel_id)
-    os.makedirs(path, exist_ok=True)
+    if storage.get().mode == "local":
+        os.makedirs(path, exist_ok=True)
     return path
+
+
+# MediaRefs are built from *this module's* AUDIO_DIR/THUMBNAIL_DIR (read at call
+# time), so tests that monkeypatch downloader.AUDIO_DIR keep steering local mode.
+def _audio_ref(channel_id: str, name: str) -> storage.MediaRef:
+    return storage.media_ref("audio", AUDIO_DIR, channel_id, name)
+
+
+def _thumb_ref(channel_id: str, name: str) -> storage.MediaRef:
+    return storage.media_ref("thumbnails", THUMBNAIL_DIR, channel_id, name)
+
+
+def _remove_media(ref: storage.MediaRef) -> None:
+    """Delete one media file/object. Local mode goes through _remove_if_exists
+    (the seam tests patch); r2 mode deletes the object and updates the index."""
+    drv = storage.get()
+    if drv.mode == "local":
+        _remove_if_exists(ref.local_path)
+    elif drv.remove(ref):
+        logger.info("Pruned %s", ref.key)
+
+
+def _store_thumbnail(url: str, channel_id: str, name: str) -> bool:
+    """Fetch a thumbnail into storage. True if it's there afterwards.
+
+    Thumbnails are cosmetic: in r2 mode a storage failure logs a warning and
+    returns False rather than failing the download it belongs to.
+    """
+    drv = storage.get()
+    ref = _thumb_ref(channel_id, name)
+    if drv.mode == "local":
+        _thumbnail_dir_for(channel_id)  # creates the directory, as before
+        return _download_thumbnail(url, ref.local_path)
+    try:
+        if drv.exists(ref):
+            return True
+        with drv.staging(None) as stage:
+            staged = os.path.join(stage, name)
+            if not _download_thumbnail(url, staged):
+                return False
+            drv.put_file(staged, ref)
+            return True
+    except storage.StorageError as exc:
+        logger.warning("Could not store thumbnail %s for %s: %s", name, channel_id, exc)
+        return False
 
 
 _NETSCAPE_HEADERS = ("# Netscape HTTP Cookie File", "# HTTP Cookie File")
@@ -380,7 +431,7 @@ def _base_ydl_opts() -> dict:
     return opts
 
 
-def _ydl_opts(channel_id: str) -> dict:
+def _ydl_opts(channel_id: str, out_dir: str | None = None) -> dict:
     return {
         **_base_ydl_opts(),
         "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
@@ -389,7 +440,9 @@ def _ydl_opts(channel_id: str) -> dict:
             "preferredcodec": _audio_codec(),
             "preferredquality": AUDIO_BITRATE_KBPS,
         }],
-        "outtmpl": os.path.join(_audio_dir_for(channel_id), "%(id)s.%(ext)s"),
+        # out_dir is the per-download staging dir in r2 mode; in local mode it
+        # is (or defaults to) the channel's real audio directory.
+        "outtmpl": os.path.join(out_dir or _audio_dir_for(channel_id), "%(id)s.%(ext)s"),
         "extract_flat": False,
         "sleep_interval": 2,
         "max_sleep_interval": 5,
@@ -419,8 +472,7 @@ def _fetch_channel_entries(channel_url: str, max_entries: int) -> tuple[list[dic
                 channel_thumb_url = t["url"]
                 break
     if channel_thumb_url:
-        dest = os.path.join(_thumbnail_dir_for(channel_id), "channel.jpg")
-        _download_thumbnail(channel_thumb_url, dest)
+        _store_thumbnail(channel_thumb_url, channel_id, "channel.jpg")
 
     return entries, channel_id, channel_name
 
@@ -439,6 +491,12 @@ def _audio_path_candidates(channel_id: str, video_id: str) -> list[str]:
     return [os.path.join(audio_dir, f"{video_id}.{e}") for e in exts]
 
 
+def _audio_refs(channel_id: str, video_id: str) -> list[storage.MediaRef]:
+    """_audio_path_candidates() as MediaRefs — current codec first."""
+    exts = [_audio_ext()] + [e for e in _KNOWN_AUDIO_EXTENSIONS if e != _audio_ext()]
+    return [_audio_ref(channel_id, f"{video_id}.{e}") for e in exts]
+
+
 def _download_entry(entry: dict, channel_id: str, channel_name: str, *,
                     enforce_duration: bool = True) -> dict | None:
     video_id = entry.get("id")
@@ -448,44 +506,54 @@ def _download_entry(entry: dict, channel_id: str, channel_name: str, *,
         logger.warning("Skipping entry with suspicious video_id: %r", video_id)
         return None
 
-    candidates = _audio_path_candidates(channel_id, video_id)
-    expected_file = candidates[0]  # current codec — what this download will write
+    drv = storage.get()
+    refs = _audio_refs(channel_id, video_id)
+    audio_ref = refs[0]  # current codec — what this download will write
     # Treat a file under any known extension as "already have it" so flipping
-    # the codec doesn't re-download an entire library.
-    existing = next((p for p in candidates if os.path.exists(p)), None)
-    if existing:
+    # the codec doesn't re-download an entire library. In r2 mode an index that
+    # can't load raises StorageUnavailable here (fail closed) rather than
+    # answering "missing" and re-downloading everything.
+    if any(drv.exists(ref) for ref in refs):
         logger.debug("Already downloaded: %s", video_id)
         return None
 
     url = entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
     logger.info("Downloading %s: %s", video_id, entry.get("title", ""))
 
-    try:
-        with yt_dlp.YoutubeDL(_ydl_opts(channel_id)) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except yt_dlp.utils.DownloadError as exc:
-        if _looks_like_member_only(str(exc)):
-            # Let the caller decide whether to remember/skip this one.
-            raise MemberOnlyError(video_id) from exc
-        if _looks_like_upcoming(str(exc)):
-            # Backstop for listings that don't carry live_status.
-            logger.info("Not yet available (upcoming premiere/stream): %s", video_id)
-            raise UpcomingError(video_id) from exc
-        logger.warning("Failed to download %s: %s", video_id, exc)
-        return None
+    # Local mode: the stage IS the channel's audio dir and put_file is a no-op.
+    # r2 mode: a private temp dir, removed on every exit path; only the final
+    # file is uploaded, and only after the duration check.
+    with drv.staging(_audio_dir_for(channel_id)) as stage:
+        expected_file = os.path.join(stage, audio_ref.name)
+        try:
+            with yt_dlp.YoutubeDL(_ydl_opts(channel_id, out_dir=stage)) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError as exc:
+            if _looks_like_member_only(str(exc)):
+                # Let the caller decide whether to remember/skip this one.
+                raise MemberOnlyError(video_id) from exc
+            if _looks_like_upcoming(str(exc)):
+                # Backstop for listings that don't carry live_status.
+                logger.info("Not yet available (upcoming premiere/stream): %s", video_id)
+                raise UpcomingError(video_id) from exc
+            logger.warning("Failed to download %s: %s", video_id, exc)
+            return None
 
-    if not os.path.exists(expected_file):
-        logger.warning("Expected file not found after download: %s", expected_file)
-        return None
+        if not os.path.exists(expected_file):
+            logger.warning("Expected file not found after download: %s", expected_file)
+            return None
 
-    if enforce_duration and _exceeds_duration_cap(info.get("duration")):
-        # Flat channel listings omit duration for live streams/premieres, so
-        # this is the only reliable point to catch them. Bin the file we just
-        # paid for and let the caller remember not to try again.
-        logger.info("Discarding %s — %ss exceeds the %d-minute cap",
-                    video_id, info.get("duration"), MAX_EPISODE_DURATION_MINUTES)
-        _remove_if_exists(expected_file)
-        raise TooLongError(video_id)
+        if enforce_duration and _exceeds_duration_cap(info.get("duration")):
+            # Flat channel listings omit duration for live streams/premieres, so
+            # this is the only reliable point to catch them. Bin the file we just
+            # paid for and let the caller remember not to try again.
+            logger.info("Discarding %s — %ss exceeds the %d-minute cap",
+                        video_id, info.get("duration"), MAX_EPISODE_DURATION_MINUTES)
+            _remove_if_exists(expected_file)
+            raise TooLongError(video_id)
+
+        filesize = os.path.getsize(expected_file)
+        drv.put_file(expected_file, audio_ref)
 
     published = info.get("upload_date", "")
     if published:
@@ -496,10 +564,8 @@ def _download_entry(entry: dict, channel_id: str, channel_name: str, *,
     # download episode thumbnail
     thumb_filename = None
     thumb_url = info.get("thumbnail")
-    if thumb_url:
-        thumb_dest = os.path.join(_thumbnail_dir_for(channel_id), f"{video_id}.jpg")
-        if _download_thumbnail(thumb_url, thumb_dest):
-            thumb_filename = os.path.basename(thumb_dest)
+    if thumb_url and _store_thumbnail(thumb_url, channel_id, f"{video_id}.jpg"):
+        thumb_filename = f"{video_id}.jpg"
 
     return {
         "id": video_id,
@@ -509,8 +575,8 @@ def _download_entry(entry: dict, channel_id: str, channel_name: str, *,
         "description": info.get("description", ""),
         "published": published,
         "duration": info.get("duration"),
-        "filename": os.path.basename(expected_file),
-        "filesize": os.path.getsize(expected_file),
+        "filename": audio_ref.name,
+        "filesize": filesize,
         "thumbnail": thumb_filename,
     }
 
@@ -544,9 +610,15 @@ def _prune_channel(channel_id: str):
     # Both caps apply: an episode inside the count cap can still be too old.
     aged = [ep for ep in episodes[:MAX_EPISODES_PER_CHANNEL] if _aged_out(ep)]
     for ep, reason in [(e, "pruned") for e in over_cap] + [(e, "aged_out") for e in aged]:
-        _remove_if_exists(os.path.join(_audio_dir_for(channel_id), ep["filename"]))
-        if ep["thumbnail"]:
-            _remove_if_exists(os.path.join(_thumbnail_dir_for(channel_id), ep["thumbnail"]))
+        # A row whose filename isn't a safe basename has no file we can locate
+        # safely; skip the file but still drop the row.
+        if is_safe_media_name(ep["filename"]):
+            _remove_media(_audio_ref(channel_id, ep["filename"]))
+        elif ep["filename"]:
+            logger.warning("Prune: not touching unsafe audio filename for %s: %r",
+                           channel_id, ep["filename"])
+        if ep["thumbnail"] and is_safe_media_name(ep["thumbnail"]):
+            _remove_media(_thumb_ref(channel_id, ep["thumbnail"]))
         db.delete_episode(ep["id"])
         # Remember it so we never re-download a video we deliberately dropped.
         # YouTube channel listings aren't strictly chronological (pinned videos,
@@ -612,6 +684,11 @@ def _sweep_orphan_files(channel_id: str) -> None:
     keep_thumbs = {ep["thumbnail"] for ep in episodes if ep["thumbnail"]}
     keep_thumbs.add("channel.jpg")
 
+    drv = storage.get()
+    if drv.mode != "local":
+        _sweep_orphan_objects(drv, channel_id, keep_audio, keep_thumbs)
+        return
+
     audio_dir = _audio_dir_for(channel_id)
     for name in os.listdir(audio_dir):
         if name in keep_audio:
@@ -629,6 +706,27 @@ def _sweep_orphan_files(channel_id: str) -> None:
         if _looks_like_ytdlp_temp(name) and _is_recent(path):
             continue
         _remove_if_exists(path)
+
+
+def _sweep_orphan_objects(drv, channel_id: str, keep_audio: set, keep_thumbs: set) -> None:
+    """r2 half of _sweep_orphan_files: same keep sets, same recency grace (by
+    the object's LastModified), so an uploaded episode whose DB row isn't
+    written yet — e.g. an in-flight .opus — is protected exactly as on disk."""
+    now = time.time()
+    for kind, keep, make_ref in (("audio", keep_audio, _audio_ref),
+                                 ("thumbnails", keep_thumbs, _thumb_ref)):
+        for name, _size, last_modified in drv.list_channel(kind, channel_id):
+            if name in keep:
+                continue
+            if (_looks_like_ytdlp_temp(name)
+                    and now - last_modified < _RECENT_FILE_GRACE_SECONDS):
+                continue
+            try:
+                ref = make_ref(channel_id, name)
+            except ValueError:
+                logger.warning("Sweep: skipping unsafe object name %r for %s", name, channel_id)
+                continue
+            _remove_media(ref)
 
 
 # Per-channel locks so two concurrent pollers (the scheduled poll_all, a
@@ -841,6 +939,8 @@ def _enforce_disk_floor() -> None:
     """
     if MIN_FREE_DISK_GB <= 0:
         return  # explicit opt-out
+    if storage.get().mode != "local":
+        return  # media lives in the R2 bucket, not on this disk; the count/age caps still prune
 
     free = _free_disk_gb(DATA_DIR)
     if free >= MIN_FREE_DISK_GB:
@@ -916,6 +1016,14 @@ def poll_all():
         _enforce_disk_floor()
     except Exception:  # noqa: BLE001 — remediation must never abort the poll run
         logger.exception("Disk-pressure check failed")
+
+    # r2 readiness gate. With no index every "already downloaded?" check fails
+    # closed, so polling now would only produce a wall of per-video errors —
+    # skip the whole run and say so once. Local mode always returns True.
+    if not storage.get().ensure_index():
+        logger.error("Media storage (R2) is unreachable — skipping this poll run")
+        notify.send_poll_failure_alert(["Media storage (R2) unreachable — poll skipped"])
+        return
 
     if not valid_cookie_file(COOKIES_FILE):
         logger.warning("Cookies file missing/invalid at poll time — alerting")
@@ -1012,6 +1120,11 @@ def remove_channel_data(channel_id: str):
     if not _CHANNEL_ID_RE.match(channel_id):
         logger.error("Refusing to delete data for suspicious channel_id: %r", channel_id)
         return
+    drv = storage.get()
+    if drv.mode != "local":
+        count = drv.delete_channel(channel_id)
+        logger.info("Removed %d stored object(s) for channel %s", count, channel_id)
+        return
     audio_dir = os.path.join(AUDIO_DIR, channel_id)
     thumb_dir = os.path.join(THUMBNAIL_DIR, channel_id)
     for path in (audio_dir, thumb_dir):
@@ -1033,12 +1146,12 @@ def delete_episode_files(channel_id: str, filename: str | None,
         logger.error("Refusing to delete files for suspicious channel_id: %r", channel_id)
         return
     if is_safe_media_name(filename):
-        _remove_if_exists(os.path.join(_audio_dir_for(channel_id), filename))
+        _remove_media(_audio_ref(channel_id, filename))
     elif filename:
         logger.warning("Refusing to delete unsafe audio filename for %s: %r",
                        channel_id, filename)
     if is_safe_media_name(thumbnail):
-        _remove_if_exists(os.path.join(_thumbnail_dir_for(channel_id), thumbnail))
+        _remove_media(_thumb_ref(channel_id, thumbnail))
 
 
 def redownload_episode(video_id: str, channel_id: str, channel_name: str) -> dict | None:
@@ -1060,8 +1173,8 @@ def redownload_episode(video_id: str, channel_id: str, channel_name: str) -> dic
         logger.warning("Refusing to re-download for suspicious channel_id: %r", channel_id)
         return None
 
-    for path in _audio_path_candidates(channel_id, video_id):
-        _remove_if_exists(path)
+    for ref in _audio_refs(channel_id, video_id):
+        _remove_media(ref)
     try:
         # enforce_duration stays on: re-downloading is not a way to smuggle an
         # over-cap video past MAX_EPISODE_DURATION_MINUTES.
@@ -1088,7 +1201,11 @@ def _dir_bytes(path: str) -> int:
 
 
 def channel_bytes(channel_id: str) -> int:
-    """Bytes on disk for one channel — its audio plus its thumbnails."""
+    """Bytes stored for one channel — its audio plus its thumbnails."""
+    drv = storage.get()
+    if drv.mode != "local":
+        return sum(size for kind in storage.KINDS
+                   for _name, size, _lm in drv.list_channel(kind, channel_id))
     return (_dir_bytes(os.path.join(AUDIO_DIR, channel_id))
             + _dir_bytes(os.path.join(THUMBNAIL_DIR, channel_id)))
 
@@ -1101,9 +1218,13 @@ def storage_usage() -> tuple[dict[str, int], int]:
     what the volume is actually holding rather than only what's subscribed.
     """
     ids: set[str] = set()
-    for base in (AUDIO_DIR, THUMBNAIL_DIR):
-        if os.path.isdir(base):
-            ids.update(n for n in os.listdir(base) if os.path.isdir(os.path.join(base, n)))
+    drv = storage.get()
+    if drv.mode != "local":
+        ids = drv.channel_ids("audio") | drv.channel_ids("thumbnails")
+    else:
+        for base in (AUDIO_DIR, THUMBNAIL_DIR):
+            if os.path.isdir(base):
+                ids.update(n for n in os.listdir(base) if os.path.isdir(os.path.join(base, n)))
     per_channel = {cid: channel_bytes(cid) for cid in ids}
     return per_channel, sum(per_channel.values())
 
@@ -1125,11 +1246,17 @@ def find_orphan_channels() -> list[dict]:
     known |= {ch["channel_id"] for ch in db.get_unsubscribed_channels()}
 
     candidate_ids = set(db.orphan_channel_ids())
-    for base in (AUDIO_DIR, THUMBNAIL_DIR):
-        if os.path.isdir(base):
-            for name in os.listdir(base):
-                if _CHANNEL_ID_RE.match(name) and name not in known:
-                    candidate_ids.add(name)
+    drv = storage.get()
+    if drv.mode != "local":
+        for kind in storage.KINDS:
+            candidate_ids.update(cid for cid in drv.channel_ids(kind)
+                                 if _CHANNEL_ID_RE.match(cid) and cid not in known)
+    else:
+        for base in (AUDIO_DIR, THUMBNAIL_DIR):
+            if os.path.isdir(base):
+                for name in os.listdir(base):
+                    if _CHANNEL_ID_RE.match(name) and name not in known:
+                        candidate_ids.add(name)
     candidate_ids -= known
 
     orphans = []

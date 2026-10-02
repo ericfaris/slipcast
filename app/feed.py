@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from feedgen.feed import FeedGenerator
 
 from app import database as db
+from app import storage
 from app.config import (
     ALL_FEED_MAX_EPISODES, BASE_URL, MAX_EPISODES_PER_CHANNEL, THUMBNAIL_DIR,
 )
@@ -44,6 +45,34 @@ _EXPLICIT_VALUES = frozenset({"yes", "no", "clean"})
 _ENCLOSURE_TYPES = {".mp3": "audio/mpeg", ".opus": "audio/ogg", ".ogg": "audio/ogg",
                     ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
                     ".wav": "audio/wav"}
+
+
+def _exists(kind: str, base_dir: str, channel_id: str, name: str) -> bool:
+    """Cosmetic existence check (channel art): an unsafe ref or any storage
+    problem counts as missing rather than failing the feed."""
+    try:
+        return storage.get().exists(storage.media_ref(kind, base_dir, channel_id, name))
+    except (ValueError, storage.StorageError):
+        return False
+
+
+def _enclosure_length(channel_id: str, ep) -> str:
+    """The enclosure byte length.
+
+    Local mode: the DB value, exactly as always. r2 mode: the object's size
+    from the in-memory index when it's there (covers migrated/legacy rows),
+    else the DB value. peek_size never does I/O or raises, so a feed request
+    can never block on, or fail because of, R2.
+    """
+    drv = storage.get()
+    if drv.mode != "local":
+        try:
+            size = drv.peek_size(storage.media_ref("audio", "", channel_id, ep["filename"]))
+        except ValueError:
+            size = None
+        if size is not None:
+            return str(size)
+    return str(ep["filesize"] or 0)
 
 
 def _enclosure_type(filename: str) -> str:
@@ -106,7 +135,7 @@ def _add_entry(fg: FeedGenerator, ep, channel_id: str, order: str = "prepend"):
     fe.published(pub)
 
     audio_url = f"{BASE_URL}/audio/{channel_id}/{ep['filename']}"
-    fe.enclosure(audio_url, str(ep["filesize"] or 0), _enclosure_type(ep["filename"]))
+    fe.enclosure(audio_url, _enclosure_length(channel_id, ep), _enclosure_type(ep["filename"]))
 
     if ep["duration"]:
         fe.podcast.itunes_duration(ep["duration"])
@@ -139,8 +168,7 @@ def build_feed(channel_id: str) -> bytes:
     fg.podcast.itunes_author(channel_name)
     fg.podcast.itunes_explicit(explicit)
     fg.podcast.itunes_category(category)
-    channel_jpg = os.path.join(THUMBNAIL_DIR, channel_id, "channel.jpg")
-    if os.path.exists(channel_jpg):
+    if _exists("thumbnails", THUMBNAIL_DIR, channel_id, "channel.jpg"):
         channel_image_url = f"{BASE_URL}/thumbnails/{channel_id}/channel.jpg"
     else:
         # fall back to first episode thumbnail that exists

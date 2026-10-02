@@ -8,6 +8,18 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.16.0",
+        "date": "2026-10-02",
+        "changes": [
+            "Episode audio and thumbnails can now live in a private Cloudflare R2 bucket instead of on the server's disk. Set STORAGE=r2 (with the four R2_* settings) to switch; STORAGE=local keeps everything exactly as before. The database, cookies and local backups stay on the data volume either way.",
+            "Nothing changes for your podcast app: feed, audio and thumbnail URLs are exactly the same. In R2 mode an audio or thumbnail link answers with a redirect to a short-lived (1 hour by default) signed download link, so the bucket serves the bytes — including seeking — instead of this server.",
+            "The low-disk safety net (MIN_FREE_DISK_GB) is skipped in R2 mode, since the audio is no longer on this disk. The per-channel episode count and age limits still prune old episodes as usual.",
+            "In R2 mode the nightly database backup is also copied to the bucket (the newest 7 are kept there too), so losing the server's disk no longer means losing your subscriptions.",
+            "A one-time migration script copies your existing library up to the bucket: run it as a dry run first, then with --apply. It verifies every upload and never deletes anything, locally or in the bucket.",
+            "If STORAGE or the R2 settings are wrong or incomplete, Slipcast now refuses to start and names exactly which setting is missing (never its value), rather than quietly saving audio somewhere it will be lost. /health also reports whether media storage is reachable.",
+        ],
+    },
+    {
         "version": "1.15.1",
         "date": "2026-10-01",
         "changes": [
