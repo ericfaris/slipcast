@@ -890,12 +890,19 @@ _PAGE = _PAGE.replace(
 )
 
 
+def _csp() -> str:
+    # /audio and /thumbnails 302 to presigned R2 URLs under STORAGE=r2, and CSP
+    # applies to redirect targets — so that one origin must be allowed for
+    # images and media, or every thumbnail and the audio player break.
+    origin = storage.get().media_origin
+    extra = f" {origin}" if origin else ""
+    return ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            f"img-src 'self' data:{extra}; media-src 'self'{extra}")
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTMLResponse(
-        content=_PAGE,
-        headers={"Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"},
-    )
+    return HTMLResponse(content=_PAGE, headers={"Content-Security-Policy": _csp()})
 
 
 # ---------------------------------------------------------------------------

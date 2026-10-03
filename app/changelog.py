@@ -8,6 +8,13 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.16.1",
+        "date": "2026-10-02",
+        "changes": [
+            "Fixed missing channel/episode thumbnails and the in-page audio player in R2 mode: the dashboard's security policy blocked the redirect to the bucket's signed links. It now allows exactly that one storage origin for images and audio.",
+        ],
+    },
+    {
         "version": "1.16.0",
         "date": "2026-10-02",
         "changes": [

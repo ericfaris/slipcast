@@ -14,7 +14,7 @@ from starlette.datastructures import Headers
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.requests import Request
 
-from app import __version__, config, database as db, downloader, feed, main, notify
+from app import __version__, config, database as db, downloader, feed, main, notify, storage
 
 
 def _req(method="GET", path="/", headers=None, client=("8.8.8.8", 1234)):
@@ -328,12 +328,31 @@ def test_feed_url_stays_absolute():
     assert url.endswith(".xml")
 
 
-def test_csp_img_src_is_self_only():
-    # The relative-URL choice above depends on the CSP staying same-origin for
-    # images (no remote hosts allowed). If this loosens, revisit the asset URLs.
+def _csp_directives():
     csp = main.index().headers["Content-Security-Policy"]
-    assert "img-src 'self' data:" in csp
-    assert "default-src 'self'" in csp
+    return dict((d.split()[0], d.split()[1:]) for d in csp.split(";") if d.strip())
+
+
+def test_csp_img_src_is_self_only():
+    # Local storage: the relative-URL choice above depends on the CSP staying
+    # same-origin for images/media (no remote hosts allowed).
+    storage._set_driver(storage.LocalDriver())
+    d = _csp_directives()
+    assert d["default-src"] == ["'self'"]
+    assert d["img-src"] == ["'self'", "data:"]
+    assert d["media-src"] == ["'self'"]
+
+
+def test_csp_allows_r2_origin_for_redirected_media(fake_r2):
+    # R2: /thumbnails and /audio 302 to presigned R2 URLs and CSP is enforced on
+    # redirect targets — without the origin, thumbnails and the player break.
+    drv, _ = fake_r2
+    origin = "https://acct-test.r2.cloudflarestorage.com"
+    assert drv.media_origin == origin
+    d = _csp_directives()
+    assert origin in d["img-src"] and origin in d["media-src"]
+    assert d["default-src"] == ["'self'"]
+    assert d["script-src"] == ["'self'"]
 
 
 # --- CSRF -------------------------------------------------------------------

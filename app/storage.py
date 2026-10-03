@@ -211,6 +211,7 @@ class LocalDriver:
     """Today's filesystem behaviour, on ``ref.local_path``."""
 
     mode = "local"
+    media_origin = None  # bytes are served same-origin
 
     def exists(self, ref: MediaRef) -> bool:
         return os.path.exists(ref.local_path)
@@ -333,6 +334,12 @@ class R2Driver:
         self._last_error: str | None = None
         self._last_error_at: float | None = None
         self._last_refresh_at: float | None = None
+
+    @property
+    def media_origin(self) -> str | None:
+        """Origin presigned URLs point at — the browser follows /audio and
+        /thumbnails 302s there, so the UI's CSP must allow it."""
+        return f"https://{self._account_id}.r2.cloudflarestorage.com" if self._account_id else None
 
     # --- secrets / client wrapper ------------------------------------------
 
