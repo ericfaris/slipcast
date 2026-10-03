@@ -15,3 +15,11 @@
 - Rollout (2026-10-02/03): deployed v1.16.0 with `STORAGE=local` → `migrate_to_r2.py --apply` in the container (205 files / 5.1 GB, 0 mismatches) → re-ran it to catch episodes polled meanwhile (uploaded 2) → flipped `.env` to `STORAGE=r2` + `docker compose up -d`. First r2 poll: "0 new" on every channel, i.e. nothing looked missing. Local `data/audio` + `data/thumbnails` kept as a cold copy until explicitly deleted.
 - Deploy gotcha: sentinel's `/api/deploy` (CI "Deploy to lab") refuses to pull when the real checkout has *any* untracked file — the `.claude/plans/` brief/plan from plan-build-test-deploy did it. Now gitignored; if CI deploy reports `pullStatus: refused`, check `git status` in `~/projects/slipcast`.
 - R2 token: `slipcast-media` has its own bucket-scoped token (verified refused on `bookhunt-library`) — don't widen another app's token to cover it.
+
+## 2026-10-02 — R2 redirects blocked by the UI's CSP (v1.16.1)
+v1.16.0 made /audio and /thumbnails 302 to presigned R2 URLs; the dashboard CSP
+(`img-src 'self'`, audio via `default-src 'self'`) silently blocked them because
+CSP is enforced on **redirect targets**, not just the original URL. Server logs
+showed clean 302s and the R2 objects returned 200 — the failure is only visible
+in the browser console. Fix: `driver.media_origin` added to img-src + media-src.
+Gotcha: when moving bytes off-origin, re-check the CSP; a test now pins both modes.
