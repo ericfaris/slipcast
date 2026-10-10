@@ -3,7 +3,7 @@
 # release to keep this current — bumps are CI-tested before they ship.
 # [default] bundles yt-dlp-ejs (the YouTube n-challenge solver scripts).
 yt-dlp[default]==2026.8.19
-fastapi==0.142.2
+fastapi==0.143.0
 uvicorn[standard]==0.54.0
 apscheduler==3.11.3
 feedgen==1.0.0
