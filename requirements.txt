@@ -10,4 +10,4 @@ feedgen==1.0.0
 python-multipart==0.0.32
 # S3 client for Cloudflare R2 media storage (STORAGE=r2); exact-pinned, Renovate
 # bumps it. Imported lazily — local mode never loads it.
-boto3==1.43.108
+boto3==1.43.111
