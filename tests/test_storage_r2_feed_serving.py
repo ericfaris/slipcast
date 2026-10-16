@@ -26,13 +26,31 @@ def _asgi(app, method, path, headers=()):
     }
     sent = []
 
-    async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+    async def main_():
+        # Like a real server (and Starlette's TestClient): deliver the request
+        # once, then block until the response is finished and report a
+        # disconnect. Answering every receive() with another http.request makes
+        # BaseHTTPMiddleware raise "Unexpected message received", but only when
+        # timing lets a disconnect listener poll early (it did on CI runners).
+        done = asyncio.Event()
+        delivered = False
 
-    async def send(message):
-        sent.append(message)
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await done.wait()
+            return {"type": "http.disconnect"}
 
-    asyncio.run(app(scope, receive, send))
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                done.set()
+
+        await app(scope, receive, send)
+
+    asyncio.run(main_())
     start = next(m for m in sent if m["type"] == "http.response.start")
     body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
     hdrs = {k.decode().lower(): v.decode() for k, v in start["headers"]}
