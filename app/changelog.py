@@ -8,6 +8,13 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.17.0",
+        "date": "2026-10-16",
+        "changes": [
+            "New, bolder app icon: a red play button broadcasting podcast waves on a deep violet tile. It's the same icon style as the other apps on this server, and it's crisp in browser tabs, on the iOS and Android home screens, and in Android's round and squircle icon shapes.",
+        ],
+    },
+    {
         "version": "1.16.1",
         "date": "2026-10-02",
         "changes": [
