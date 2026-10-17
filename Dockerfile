@@ -1,4 +1,5 @@
-FROM python:3.12-slim
+# Newest Python whose deps all have wheels; on 2026-10-17 brotli (via yt-dlp[default]) had none for 3.15.
+FROM python:3.14-slim-trixie
 
 # Node 22+ is required by yt-dlp's EJS challenge solver (the older Debian
 # nodejs package is too old and yt-dlp reports it as "unsupported").
