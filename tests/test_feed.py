@@ -1,7 +1,7 @@
 """Tests for RSS feed generation, including the per-feed episode cap."""
 from xml.etree import ElementTree as ET
 
-from app import database as db, feed
+from app import config, database as db, feed
 
 CID = "UCabc12345678901234567890"
 
@@ -37,7 +37,7 @@ def test_feed_caps_at_max(tmp_path, monkeypatch):
     """Even if the DB has drifted over the cap, the feed must not expose more
     than MAX_EPISODES_PER_CHANNEL items."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(feed, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     for i in range(34):
         db.upsert_episode(_ep(i))
     assert len(db.get_episodes(CID)) == 34
@@ -46,7 +46,7 @@ def test_feed_caps_at_max(tmp_path, monkeypatch):
 
 def test_feed_includes_all_episodes_under_cap(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(feed, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     for i in range(5):
         db.upsert_episode(_ep(i))
     items = _items(feed.build_feed(CID))
@@ -56,7 +56,7 @@ def test_feed_includes_all_episodes_under_cap(tmp_path, monkeypatch):
 
 def test_feed_includes_enclosure_and_metadata(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(feed, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     db.upsert_episode(_ep(1))
     xml = feed.build_feed(CID)
     item = _items(xml)[0]
@@ -70,7 +70,7 @@ def test_feed_skips_item_with_unsafe_filename(tmp_path, monkeypatch):
     # Defense in depth: an entry whose filename can't be safely placed in a
     # path is dropped rather than emitted with a traversal enclosure URL.
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(feed, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     good = _ep(1)
     bad = _ep(2)
     bad["filename"] = "../../etc/passwd"
@@ -85,7 +85,7 @@ def test_feed_skips_item_with_unsafe_filename(tmp_path, monkeypatch):
 
 def test_feed_omits_unsafe_episode_thumbnail(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(feed, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     ep = _ep(1)
     ep["thumbnail"] = "../../evil.jpg"  # filename itself is still safe
     db.upsert_episode(ep)
@@ -96,7 +96,7 @@ def test_feed_omits_unsafe_episode_thumbnail(tmp_path, monkeypatch):
 
 def test_feed_survives_bad_published_date(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(feed, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     ep = _ep(1)
     ep["published"] = "not-a-date"
     db.upsert_episode(ep)
@@ -109,7 +109,7 @@ def test_feed_enclosure_type_matches_extension(tmp_path, monkeypatch):
     (AUDIO_CODEC changed mid-flight) — each item's enclosure MIME must match
     its own stored file, not a single global setting."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(feed, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     mp3_ep = _ep(1)
     opus_ep = _ep(2)
     opus_ep["filename"] = "v002.opus"
@@ -126,7 +126,7 @@ def test_feed_enclosure_type_matches_extension(tmp_path, monkeypatch):
 
 def test_feed_unknown_extension_defaults_to_audio_mpeg(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(feed, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     ep = _ep(1)
     ep["filename"] = "v001.weird"
     db.upsert_episode(ep)
@@ -180,7 +180,7 @@ def test_combined_feed_merges_subscribed_channels_newest_first(tmp_path, monkeyp
 
 def test_combined_feed_respects_cap(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(feed, "ALL_FEED_MAX_EPISODES", 5)
+    monkeypatch.setattr(config, "ALL_FEED_MAX_EPISODES", 5)
     _subscribe(CID, "Chan A")
     for i in range(12):
         db.upsert_episode(_ep(i))

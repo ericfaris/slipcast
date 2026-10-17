@@ -5,9 +5,10 @@ from feedgen.feed import FeedGenerator
 
 from app import database as db
 from app import storage
-from app.config import (
-    ALL_FEED_MAX_EPISODES, BASE_URL, MAX_EPISODES_PER_CHANNEL, THUMBNAIL_DIR,
-)
+from app import config
+# ALL_FEED_MAX_EPISODES / MAX_EPISODES_PER_CHANNEL are runtime-editable (see
+# app/settings.py), so they're read as config.X rather than imported.
+from app.config import BASE_URL, THUMBNAIL_DIR
 from app.safety import is_safe_media_name
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,7 @@ def _add_entry(fg: FeedGenerator, ep, channel_id: str, order: str = "prepend"):
 def build_feed(channel_id: str) -> bytes:
     # Defense in depth: cap the feed itself rather than trusting that pruning
     # has kept the DB at/under the limit. get_episodes returns newest-first.
-    episodes = db.get_episodes(channel_id)[:MAX_EPISODES_PER_CHANNEL]
+    episodes = db.get_episodes(channel_id)[:config.MAX_EPISODES_PER_CHANNEL]
     if not episodes:
         return b""
 
@@ -197,7 +198,7 @@ def build_combined_feed() -> bytes:
     One-off (unsubscribed) channels are deliberately excluded: they're an
     explicit single-video download, not something the user subscribed to.
     """
-    episodes = db.get_combined_episodes(ALL_FEED_MAX_EPISODES)
+    episodes = db.get_combined_episodes(config.ALL_FEED_MAX_EPISODES)
     if not episodes:
         return b""
 

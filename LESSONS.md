@@ -32,3 +32,16 @@ Gotcha: when moving bytes off-origin, re-check the CSP; a test now pins both mod
 - To test a new base image, run `pip install -r requirements.txt` in a throwaway `python:<tag>`
   container. Don't use `--only-binary=:all:` here: `feedgen` is sdist-only (pure Python), so
   that flag fails for a reason unrelated to the new Python.
+
+## 2026-10-17 — runtime-editable settings (v1.18.0)
+
+- The Settings dialog stores overrides in the `settings` table (`config:<NAME>`) and applies them by
+  assigning to `app.config` attributes. Every reader therefore has to use `config.NAME`. A
+  `from app.config import NAME` freezes the env value and silently ignores the dialog;
+  `tests/test_settings.py::test_no_module_freezes_an_editable_setting` guards against that. Tests
+  monkeypatch `config.NAME`, not `downloader.NAME`/`feed.NAME`/`main.NAME`.
+- Saving the env default deletes the override instead of storing a copy, so a later `.env` change
+  still takes effect.
+- Two settings have side effects beyond the attribute: POLL_INTERVAL_HOURS calls `reschedule_job`
+  (job id `poll_all`; the countdown restarts), and POLL_CONCURRENCY swaps in a new ThreadPoolExecutor
+  under a lock because pools can't be resized. Submissions go through `_submit_poll`.

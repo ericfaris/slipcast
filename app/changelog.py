@@ -8,6 +8,14 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.18.0",
+        "date": "2026-10-17",
+        "changes": [
+            "The Settings button now opens real settings. A Settings tab lets you change the polling interval, how many channels poll at once, the long-video skip limit, episode retention (count, age and minimum free disk), feed-token enforcement, the combined feed size, and the alert email, warning lead time and cooldown. About and the changelog moved to their own tab.",
+            "Changes apply immediately, with no restart. Changing the polling interval restarts the countdown to the next poll. Each value starts at your .env setting, and Reset returns it there. SMTP, storage and login settings still live only in .env.",
+        ],
+    },
+    {
         "version": "1.17.0",
         "date": "2026-10-16",
         "changes": [

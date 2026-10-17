@@ -684,6 +684,11 @@ def set_setting(key: str, value: str) -> None:
         )
 
 
+def delete_setting(key: str) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
+
 def get_or_create_all_feed_token() -> str:
     """Token for the combined /feed/all.xml, created on first access.
 

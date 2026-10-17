@@ -15,19 +15,18 @@ from app import database as db
 from app import notify
 from app import storage
 from app.safety import is_safe_media_name
+from app import config
 from app.config import (
     AUDIO_BITRATE_KBPS,
     AUDIO_CODEC,
     AUDIO_DIR,
-    COOKIE_EXPIRY_WARN_DAYS,
     COOKIES_FILE,
     DATA_DIR,
-    MAX_EPISODE_AGE_DAYS,
-    MAX_EPISODE_DURATION_MINUTES,
-    MAX_EPISODES_PER_CHANNEL,
-    MIN_FREE_DISK_GB,
     THUMBNAIL_DIR,
 )
+# COOKIE_EXPIRY_WARN_DAYS, MAX_EPISODE_*, MAX_EPISODES_PER_CHANNEL and
+# MIN_FREE_DISK_GB are read as config.X at use time: the Settings dialog
+# changes them at runtime (see app/settings.py).
 
 _CHANNEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # Real YouTube video IDs are exactly 11 chars. Channel listings occasionally
@@ -183,9 +182,9 @@ def _exceeds_duration_cap(duration) -> bool:
     A missing duration is never "too long" — flat channel listings omit it for
     live streams and premieres, which the post-download check catches instead.
     """
-    if not MAX_EPISODE_DURATION_MINUTES or not duration:
+    if not config.MAX_EPISODE_DURATION_MINUTES or not duration:
         return False
-    return duration > MAX_EPISODE_DURATION_MINUTES * 60
+    return duration > config.MAX_EPISODE_DURATION_MINUTES * 60
 
 
 def _download_thumbnail(url: str, dest: str) -> bool:
@@ -548,7 +547,7 @@ def _download_entry(entry: dict, channel_id: str, channel_name: str, *,
             # this is the only reliable point to catch them. Bin the file we just
             # paid for and let the caller remember not to try again.
             logger.info("Discarding %s — %ss exceeds the %d-minute cap",
-                        video_id, info.get("duration"), MAX_EPISODE_DURATION_MINUTES)
+                        video_id, info.get("duration"), config.MAX_EPISODE_DURATION_MINUTES)
             _remove_if_exists(expected_file)
             raise TooLongError(video_id)
 
@@ -593,7 +592,7 @@ def _aged_out(ep) -> bool:
     An unparseable date is never treated as aged out — a bad timestamp must not
     silently delete audio.
     """
-    if not MAX_EPISODE_AGE_DAYS:
+    if not config.MAX_EPISODE_AGE_DAYS:
         return False
     try:
         pub = datetime.fromisoformat(ep["published"])
@@ -601,14 +600,14 @@ def _aged_out(ep) -> bool:
         return False
     if pub.tzinfo is None:
         pub = pub.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - pub).days > MAX_EPISODE_AGE_DAYS
+    return (datetime.now(timezone.utc) - pub).days > config.MAX_EPISODE_AGE_DAYS
 
 
 def _prune_channel(channel_id: str):
     episodes = db.get_episodes(channel_id)
-    over_cap = episodes[MAX_EPISODES_PER_CHANNEL:]
+    over_cap = episodes[config.MAX_EPISODES_PER_CHANNEL:]
     # Both caps apply: an episode inside the count cap can still be too old.
-    aged = [ep for ep in episodes[:MAX_EPISODES_PER_CHANNEL] if _aged_out(ep)]
+    aged = [ep for ep in episodes[:config.MAX_EPISODES_PER_CHANNEL] if _aged_out(ep)]
     for ep, reason in [(e, "pruned") for e in over_cap] + [(e, "aged_out") for e in aged]:
         # A row whose filename isn't a safe basename has no file we can locate
         # safely; skip the file but still drop the row.
@@ -793,7 +792,7 @@ def _poll_channel_locked(channel_url: str):
         _prune_channel(known_channel_id)
 
     try:
-        entries, channel_id, channel_name = _fetch_channel_entries(channel_url, MAX_EPISODES_PER_CHANNEL * 3)
+        entries, channel_id, channel_name = _fetch_channel_entries(channel_url, config.MAX_EPISODES_PER_CHANNEL * 3)
     except Exception as exc:
         logger.error("Failed to fetch channel %s: %s", channel_url, exc)
         if not valid_cookie_file(COOKIES_FILE) or _looks_like_auth_error(str(exc)):
@@ -820,7 +819,7 @@ def _poll_channel_locked(channel_url: str):
             # cap by date, download them, then immediately prune them — wasteful
             # churn. Channel listings are newest-first, so the top MAX are what
             # we want to keep.
-            if considered >= MAX_EPISODES_PER_CHANNEL:
+            if considered >= config.MAX_EPISODES_PER_CHANNEL:
                 break
             video_id = entry.get("id")
             if video_id in skip_ids:
@@ -937,18 +936,18 @@ def _enforce_disk_floor() -> None:
 
     This deletes the user's downloads irreversibly, so it always emails.
     """
-    if MIN_FREE_DISK_GB <= 0:
+    if config.MIN_FREE_DISK_GB <= 0:
         return  # explicit opt-out
     if storage.get().mode != "local":
         return  # media lives in the R2 bucket, not on this disk; the count/age caps still prune
 
     free = _free_disk_gb(DATA_DIR)
-    if free >= MIN_FREE_DISK_GB:
+    if free >= config.MIN_FREE_DISK_GB:
         return
 
     logger.warning(
         "Free disk %.2f GB is below MIN_FREE_DISK_GB=%d — pruning oldest episodes",
-        free, MIN_FREE_DISK_GB,
+        free, config.MIN_FREE_DISK_GB,
     )
 
     pruned: list[str] = []
@@ -988,7 +987,7 @@ def _enforce_disk_floor() -> None:
         # size: one episode can be hundreds of MB, and this stops the moment
         # we're back above the floor, deleting the minimum necessary.
         free = _free_disk_gb(DATA_DIR)
-        if free >= MIN_FREE_DISK_GB:
+        if free >= config.MIN_FREE_DISK_GB:
             break
 
     if pruned:
@@ -996,11 +995,11 @@ def _enforce_disk_floor() -> None:
                        len(pruned), freed_bytes / 1_048_576, free)
         notify.send_disk_prune_alert(pruned, freed_bytes, free)
 
-    if free < MIN_FREE_DISK_GB:
+    if free < config.MIN_FREE_DISK_GB:
         logger.error(
             "Free disk still %.2f GB after pruning everything available "
             "(threshold %d GB) — something other than episodes is using the volume",
-            free, MIN_FREE_DISK_GB,
+            free, config.MIN_FREE_DISK_GB,
         )
         if not pruned:
             # send_disk_prune_alert([]) is a no-op by design, but "the disk is
@@ -1035,7 +1034,7 @@ def poll_all():
         status = cookies_status()
         days_left = status.get("days_until_expiry")
         if (not status.get("expired") and days_left is not None
-                and days_left <= COOKIE_EXPIRY_WARN_DAYS):
+                and days_left <= config.COOKIE_EXPIRY_WARN_DAYS):
             logger.info("Cookies expire in %d days — sending advance warning", days_left)
             notify.send_cookie_expiry_warning(days_left, status["expires_at"])
     channels = db.get_channels()
@@ -1090,7 +1089,7 @@ def download_single(video_url: str, subscribe: bool = False):
     if _exceeds_duration_cap(info.get("duration")):
         logger.warning("One-off download of %s is longer than the %d-minute cap "
                        "— downloading anyway (explicit request)",
-                       video_id, MAX_EPISODE_DURATION_MINUTES)
+                       video_id, config.MAX_EPISODE_DURATION_MINUTES)
 
     try:
         result = _download_entry({"id": video_id}, channel_id, channel_name,

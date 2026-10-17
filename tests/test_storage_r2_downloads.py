@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from app import database as db, downloader, storage
+from app import config, database as db, downloader, storage
 
 CID = "UCabc12345678901234567890"
 VID = "dQw4w9WgXcQ"
@@ -144,7 +144,7 @@ def test_download_error_uploads_nothing(r2, tmp_path, monkeypatch):
 
 def test_too_long_uploads_nothing(r2, tmp_path, monkeypatch):
     drv, fake = r2
-    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+    monkeypatch.setattr(config, "MAX_EPISODE_DURATION_MINUTES", 30)
     _patch_ydl(monkeypatch, duration=7200)
     with pytest.raises(downloader.TooLongError):
         downloader._download_entry({"id": VID}, CID, "C")

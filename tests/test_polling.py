@@ -4,7 +4,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 
-from app import database as db, downloader
+from app import config, database as db, downloader
 
 CID = "UCabc12345678901234567890"  # valid channel_id per the regex
 
@@ -27,7 +27,7 @@ def _ep(i, cid=CID):
 
 def test_prune_enforces_cap(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     for i in range(30):
         db.upsert_episode(_ep(i))
     assert len(db.get_episodes(CID)) == 30
@@ -37,7 +37,7 @@ def test_prune_enforces_cap(tmp_path, monkeypatch):
 
 def test_prune_keeps_newest(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 5)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 5)
     for i in range(10):
         db.upsert_episode(_ep(i))
     downloader._prune_channel(CID)
@@ -51,7 +51,7 @@ def test_prune_keeps_newest(tmp_path, monkeypatch):
 def test_prune_records_skip_for_deleted(tmp_path, monkeypatch):
     """Pruned videos are remembered so future polls don't re-download them."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 2)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 2)
     for i in range(5):
         db.upsert_episode(_ep(i))  # published ascends with i -> newest = highest i
     downloader._prune_channel(CID)
@@ -65,7 +65,7 @@ def test_prune_deletes_thumbnails_and_sweeps_orphans(tmp_path, monkeypatch):
     """Prune deletes the dropped episode's audio + thumbnail, and the sweep
     removes any leftover files the DB no longer references — except channel.jpg."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 2)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 2)
     audio_dir = downloader._audio_dir_for(CID)
     thumb_dir = downloader._thumbnail_dir_for(CID)
 
@@ -100,7 +100,7 @@ def test_sweep_skips_recent_temp_files_but_deletes_stale_ones(tmp_path, monkeypa
     must survive a concurrent sweep if it's recent, but a genuinely abandoned
     one (old) still gets cleaned up."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     audio_dir = downloader._audio_dir_for(CID)
     thumb_dir = downloader._thumbnail_dir_for(CID)
 
@@ -125,7 +125,7 @@ def test_poll_does_not_redownload_pruned_video(tmp_path, monkeypatch):
     while prune keeps newest-by-date, so without a skip record the two fight
     and re-download the same video every poll, pushing counts past the cap."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 2)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 2)
     url = "https://www.youtube.com/@SomeChannel"
     db.add_channel(url)
     db.update_channel_meta(url, CID, "C")
@@ -197,7 +197,7 @@ def test_poll_prunes_even_when_fetch_fails(tmp_path, monkeypatch):
     """Regression: an over-cap channel must be pruned even if the fetch raises
     (e.g. expired cookies), instead of returning early and never capping."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
 
     url = "https://www.youtube.com/@SomeChannel"
     db.add_channel(url)
@@ -241,7 +241,7 @@ def test_poll_loop_caps_downloads(tmp_path, monkeypatch):
     """Regression for 'episode numbers above twenty': a successful poll must
     stop downloading at the cap and finish with exactly MAX episodes."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     url = "https://www.youtube.com/@SomeChannel"
     db.add_channel(url)
 
@@ -259,7 +259,7 @@ def test_poll_loop_caps_downloads(tmp_path, monkeypatch):
 def test_poll_skips_members_only_and_records_skip(tmp_path, monkeypatch):
     """Members-only entries are not downloaded and are remembered for fast-skip."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     url = "https://www.youtube.com/@SomeChannel"
     db.add_channel(url)
 
@@ -283,7 +283,7 @@ def test_poll_strips_query_string_before_appending_videos(tmp_path, monkeypatch)
     '/videos' suffix, making yt-dlp resolve to the channel's tab list instead
     of its actual videos, so every poll silently downloads nothing."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     raw_url = "https://youtube.com/@jason_samosa?si=X5yUqCOVRTbOweX5"
     db.add_channel(raw_url)
 
@@ -303,7 +303,7 @@ def test_poll_strips_query_string_before_appending_videos(tmp_path, monkeypatch)
 
 def test_poll_records_ok_run(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
     url = "https://www.youtube.com/@SomeChannel"
     db.add_channel(url)
     entries = [{"id": f"v{i:03d}", "availability": None} for i in range(3)]
@@ -343,7 +343,7 @@ def test_poll_records_error_run(tmp_path, monkeypatch):
 def test_poll_all_warns_when_cookies_expiring_soon(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
     monkeypatch.setattr(downloader, "valid_cookie_file", lambda _p: True)
-    monkeypatch.setattr(downloader, "COOKIE_EXPIRY_WARN_DAYS", 7)
+    monkeypatch.setattr(config, "COOKIE_EXPIRY_WARN_DAYS", 7)
     monkeypatch.setattr(downloader, "cookies_status",
                         lambda: {"expired": False, "days_until_expiry": 3,
                                  "expires_at": "2026-12-24 12:45 UTC"})
@@ -361,7 +361,7 @@ def test_poll_all_warns_when_cookies_expiring_soon(tmp_path, monkeypatch):
 def test_poll_all_no_warning_when_expiry_far_off(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
     monkeypatch.setattr(downloader, "valid_cookie_file", lambda _p: True)
-    monkeypatch.setattr(downloader, "COOKIE_EXPIRY_WARN_DAYS", 7)
+    monkeypatch.setattr(config, "COOKIE_EXPIRY_WARN_DAYS", 7)
     monkeypatch.setattr(downloader, "cookies_status",
                         lambda: {"expired": False, "days_until_expiry": 179,
                                  "expires_at": "2026-12-24 12:45 UTC"})
@@ -493,7 +493,7 @@ def test_poll_channel_releases_lock_after_completion(tmp_path, monkeypatch):
 
 def test_download_single_prunes_over_cap_channel(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 2)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 2)
     for i in range(5):
         db.upsert_episode(_ep(i))  # 5 episodes already on this unsubscribed channel
 
@@ -640,7 +640,7 @@ def _capture_prune_alert(monkeypatch):
 def test_disk_floor_prunes_globally_oldest_across_channels(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
     monkeypatch.setattr(downloader, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 2)
+    monkeypatch.setattr(config, "MIN_FREE_DISK_GB", 2)
 
     files = {}
     # Interleaved across two channels: v000 (CID2) and v001 (CID) are the two
@@ -681,7 +681,7 @@ def test_disk_floor_prunes_globally_oldest_across_channels(tmp_path, monkeypatch
 def test_disk_floor_noop_when_space_is_plentiful(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
     monkeypatch.setattr(downloader, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 2)
+    monkeypatch.setattr(config, "MIN_FREE_DISK_GB", 2)
     for i in range(3):
         _seed_episode_with_files(_ep(i))
     _fake_disk(monkeypatch, [50.0])
@@ -697,7 +697,7 @@ def test_disk_floor_noop_when_space_is_plentiful(tmp_path, monkeypatch):
 def test_disk_floor_disabled_by_zero_threshold(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
     monkeypatch.setattr(downloader, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 0)
+    monkeypatch.setattr(config, "MIN_FREE_DISK_GB", 0)
     _seed_episode_with_files(_ep(0))
 
     def _boom(path):
@@ -712,7 +712,7 @@ def test_disk_floor_alerts_when_nothing_left_to_prune(tmp_path, monkeypatch):
     """Still-full after deleting everything is the loudest case, not a quiet one."""
     _setup_tmp(tmp_path, monkeypatch)
     monkeypatch.setattr(downloader, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 2)
+    monkeypatch.setattr(config, "MIN_FREE_DISK_GB", 2)
     _fake_disk(monkeypatch, [0.1])  # never clears
     alerts = _capture_prune_alert(monkeypatch)
 
@@ -725,7 +725,7 @@ def test_disk_floor_alerts_when_nothing_left_to_prune(tmp_path, monkeypatch):
 def test_disk_floor_continues_past_a_failed_deletion(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
     monkeypatch.setattr(downloader, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 2)
+    monkeypatch.setattr(config, "MIN_FREE_DISK_GB", 2)
     for i in range(3):
         _seed_episode_with_files(_ep(i))
 
@@ -850,8 +850,8 @@ def _ep_aged(i, days_old, cid=CID):
 
 def test_prune_removes_aged_out_episodes(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 100)  # count cap inert
-    monkeypatch.setattr(downloader, "MAX_EPISODE_AGE_DAYS", 30)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 100)  # count cap inert
+    monkeypatch.setattr(config, "MAX_EPISODE_AGE_DAYS", 30)
     ages = {0: 1, 1: 5, 2: 40, 3: 400}
     audio_dir = downloader._audio_dir_for(CID)
     for i, days_old in ages.items():
@@ -872,8 +872,8 @@ def test_prune_removes_aged_out_episodes(tmp_path, monkeypatch):
 
 def test_prune_age_disabled_by_default(tmp_path, monkeypatch):
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 100)
-    monkeypatch.setattr(downloader, "MAX_EPISODE_AGE_DAYS", 0)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 100)
+    monkeypatch.setattr(config, "MAX_EPISODE_AGE_DAYS", 0)
     for i, days_old in {0: 1, 1: 5, 2: 40, 3: 400}.items():
         db.upsert_episode(_ep_aged(i, days_old))
 
@@ -886,8 +886,8 @@ def test_prune_applies_both_caps(tmp_path, monkeypatch):
     """An episode can be dropped either for being over the count cap or too
     old — both apply, independently, and record the matching reason."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 3)
-    monkeypatch.setattr(downloader, "MAX_EPISODE_AGE_DAYS", 30)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 3)
+    monkeypatch.setattr(config, "MAX_EPISODE_AGE_DAYS", 30)
     # By age (newest first): v000(1d), v001(2d), v003(40d), v002(50d), v004(60d), v005(70d).
     # v003 ranks inside the top-3 count-cap slice but is still past the 30-day
     # age cap, so it must be dropped for "aged_out" specifically — the other
@@ -923,8 +923,8 @@ def test_poll_skips_over_long_entry_before_download(tmp_path, monkeypatch):
     never reach _download_entry (no bandwidth wasted), and must stay skipped
     on the next poll."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
-    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODE_DURATION_MINUTES", 30)
     url = "https://www.youtube.com/@SomeChannel"
     db.add_channel(url)
 
@@ -950,8 +950,8 @@ def test_poll_discards_over_long_video_after_download(tmp_path, monkeypatch):
     """A live-stream/premiere entry with no flat duration is caught by the
     post-download backstop instead."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
-    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODE_DURATION_MINUTES", 30)
     url = "https://www.youtube.com/@SomeChannel"
     db.add_channel(url)
 
@@ -977,7 +977,7 @@ def test_download_entry_deletes_over_long_file(tmp_path, monkeypatch):
     """Exercise the real _download_entry: the just-downloaded file must be
     removed and TooLongError raised when the real duration exceeds the cap."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+    monkeypatch.setattr(config, "MAX_EPISODE_DURATION_MINUTES", 30)
     audio_dir = downloader._audio_dir_for(CID)
 
     class _FakeDownloadYDL:
@@ -1006,7 +1006,7 @@ def test_download_single_ignores_duration_cap(tmp_path, monkeypatch):
     """One-off downloads are an explicit user request — they warn but still
     download an over-long video."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+    monkeypatch.setattr(config, "MAX_EPISODE_DURATION_MINUTES", 30)
 
     info = {"id": "vNEW00000001", "channel_id": CID, "channel": "C", "duration": 7200}
     monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", lambda *a, **k: _FakeYDL(info))
@@ -1031,7 +1031,7 @@ def test_poll_skips_upcoming_entry_without_skip_record(tmp_path, monkeypatch):
     """An un-aired premiere is never attempted, never recorded as a skip (so it
     downloads once it airs), and doesn't take a slot in the newest-N window."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 2)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 2)
     url = "https://www.youtube.com/@SomeChannel"
     db.add_channel(url)
 
@@ -1053,7 +1053,7 @@ def test_poll_upcoming_error_is_not_a_failure(tmp_path, monkeypatch):
     """Backstop: a listing without live_status reaches the download, which
     raises UpcomingError — no failure, no alert, no skip, no slot used."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 1)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 1)
     url = "https://www.youtube.com/@SomeChannel"
     db.add_channel(url)
 
@@ -1121,8 +1121,8 @@ def test_looks_like_upcoming():
 def test_poll_still_records_members_only_and_too_long_skips(tmp_path, monkeypatch):
     """Regression: the upcoming path must not swallow the permanent skips."""
     _setup_tmp(tmp_path, monkeypatch)
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 20)
-    monkeypatch.setattr(downloader, "MAX_EPISODE_DURATION_MINUTES", 30)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 20)
+    monkeypatch.setattr(config, "MAX_EPISODE_DURATION_MINUTES", 30)
     url = "https://www.youtube.com/@SomeChannel"
     db.add_channel(url)
 

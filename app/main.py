@@ -21,14 +21,17 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from app import changelog
+from app import config
 from app import database as db
 from app import jobs
 from app import notify
+from app import settings
 from app import storage
 from app.safety import is_safe_media_name
+# ALERT_EMAIL, POLL_CONCURRENCY, POLL_INTERVAL_HOURS and REQUIRE_FEED_TOKENS
+# are runtime-editable (see app/settings.py), so they're read as config.X.
 from app.config import (
-    AUDIO_DIR, ALERT_EMAIL, ALL_FEED_MAX_EPISODES, AUTH_CREDENTIALS, BASE_URL,
-    COOKIES_FILE, POLL_CONCURRENCY, POLL_INTERVAL_HOURS, REQUIRE_FEED_TOKENS,
+    AUDIO_DIR, AUTH_CREDENTIALS, BASE_URL, COOKIES_FILE,
     STORAGE_INDEX_REFRESH_MINUTES, THUMBNAIL_DIR,
 )
 from app.downloader import (
@@ -73,7 +76,12 @@ _scheduler: BackgroundScheduler | None = None
 # previously one unbounded thread per channel, which could also fire dozens of
 # concurrent yt-dlp processes. submit() returns immediately, so the endpoints
 # that use this still respond right away.
-_poll_executor = ThreadPoolExecutor(max_workers=POLL_CONCURRENCY, thread_name_prefix="poll")
+_poll_executor = ThreadPoolExecutor(max_workers=config.POLL_CONCURRENCY, thread_name_prefix="poll")
+_poll_executor_size = config.POLL_CONCURRENCY
+# Guards swapping the pool (POLL_CONCURRENCY changed in Settings) against a
+# concurrent submit landing on the pool being shut down.
+_poll_executor_lock = threading.Lock()
+_POLL_JOB_ID = "poll_all"
 
 # Paths that podcast apps access — no auth required. Matched as prefixes, so
 # "/health" also covers "/health/live"; keep it that way — the Docker
@@ -102,12 +110,16 @@ _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")
 async def lifespan(app: FastAPI):
     global _scheduler
     db.init_db()
+    # Dashboard overrides (app/settings.py) must be in place before anything
+    # below reads POLL_INTERVAL_HOURS / POLL_CONCURRENCY.
+    settings.load()
+    _resize_poll_executor()
 
     _scheduler = BackgroundScheduler()
     # coalesce + a generous misfire grace so a slow run doesn't permanently
     # wedge the schedule; max_instances=1 still prevents overlapping polls.
-    _scheduler.add_job(poll_all, "interval", hours=POLL_INTERVAL_HOURS,
-                       coalesce=True, misfire_grace_time=3600, max_instances=1)
+    _scheduler.add_job(poll_all, "interval", hours=config.POLL_INTERVAL_HOURS,
+                       id=_POLL_JOB_ID, coalesce=True, misfire_grace_time=3600, max_instances=1)
     _scheduler.add_job(_prune_rate_limit_table, "interval", hours=1)
     # Nightly DB snapshot + corruption check. 03:00 is a quiet hour, and a fixed
     # hour is far easier to reason about ("last night's backup") than a 24h
@@ -148,6 +160,44 @@ async def lifespan(app: FastAPI):
 
     _scheduler.shutdown()
     _poll_executor.shutdown(wait=False)
+
+
+def _resize_poll_executor() -> None:
+    """Swap in a poll pool sized to the current POLL_CONCURRENCY.
+
+    ThreadPoolExecutor can't be resized in place. The old pool is shut down
+    without waiting, which still runs everything already queued on it — so a
+    poll-all in flight finishes at the old width, and only new submissions see
+    the new one.
+    """
+    global _poll_executor, _poll_executor_size
+    with _poll_executor_lock:
+        if _poll_executor_size == config.POLL_CONCURRENCY:
+            return
+        old = _poll_executor
+        _poll_executor_size = config.POLL_CONCURRENCY
+        _poll_executor = ThreadPoolExecutor(max_workers=_poll_executor_size,
+                                            thread_name_prefix="poll")
+        old.shutdown(wait=False)
+
+
+def _submit_poll(url: str) -> None:
+    with _poll_executor_lock:
+        _poll_executor.submit(_run_poll, url)
+
+
+def _apply_setting_changes(changed: list[str]) -> None:
+    """Side effects for settings that something already holds onto.
+
+    Everything else is read as config.X at use time and needs nothing here.
+    """
+    if "POLL_INTERVAL_HOURS" in changed and _scheduler is not None:
+        # Restarts the countdown from now — the simplest predictable behaviour
+        # (otherwise shortening 24h -> 1h could still wait out the old 24h).
+        _scheduler.reschedule_job(_POLL_JOB_ID, trigger="interval",
+                                  hours=config.POLL_INTERVAL_HOURS)
+    if "POLL_CONCURRENCY" in changed:
+        _resize_poll_executor()
 
 
 def _report_orphans() -> None:
@@ -482,7 +532,7 @@ def _polling_state() -> dict:
     runs = db.get_recent_poll_runs(25)
     last_at = runs[0]["finished_at"] or runs[0]["started_at"] if runs else None
     return {
-        "interval_hours": POLL_INTERVAL_HOURS,
+        "interval_hours": config.POLL_INTERVAL_HOURS,
         "next_poll_at": _next_poll_at(),
         "next_poll": _next_poll_label(),
         "last_poll_at": last_at,
@@ -520,7 +570,7 @@ def _token_ok(expected: str | None, provided: str | None) -> bool:
     servable by anyone. The falsy guard also keeps compare_digest from raising
     on a None (a missing ?token=), which would be a 500 on a public endpoint.
     """
-    if not REQUIRE_FEED_TOKENS:
+    if not config.REQUIRE_FEED_TOKENS:
         return True
     if not expected or not provided:
         return False
@@ -855,17 +905,32 @@ _PAGE = """<!DOCTYPE html>
         <div class="modal-backdrop" data-close></div>
         <div class="modal-card modal-wide" role="dialog" aria-modal="true" aria-labelledby="settings-title">
             <button class="modal-close" type="button" data-close aria-label="Close">&times;</button>
-            <h3 id="settings-title">About Slipcast</h3>
-            <p class="share-name">Self-hosted YouTube-to-podcast server</p>
-            <dl class="about-meta">
-                <div><dt>Version</dt><dd id="about-version">—</dd></div>
-                <div><dt>Running since</dt><dd id="about-started">—</dd></div>
-            </dl>
-            <h4 class="about-h">Changelog</h4>
-            <div id="changelog-list" class="changelog"></div>
-            <p class="share-name" style="margin-top:14px;margin-bottom:0">
-                <a href="/static/design-system.html" target="_blank" rel="noopener">View design system &rarr;</a>
-            </p>
+            <h3 id="settings-title">Settings</h3>
+            <div class="tabs" role="tablist" aria-label="Settings sections">
+                <button class="tab" type="button" role="tab" id="tab-prefs" aria-controls="panel-prefs" aria-selected="true">Settings</button>
+                <button class="tab" type="button" role="tab" id="tab-about" aria-controls="panel-about" aria-selected="false" tabindex="-1">About</button>
+            </div>
+            <div id="panel-prefs" role="tabpanel" aria-labelledby="tab-prefs">
+                <form id="prefs-form" class="prefs-form" autocomplete="off" novalidate>
+                    <div id="prefs-fields" class="prefs-fields"></div>
+                    <div class="prefs-actions">
+                        <span class="prefs-note">Saved settings override .env and apply immediately.</span>
+                        <button id="prefs-save" class="btn btn-primary" type="submit" disabled>Save</button>
+                    </div>
+                </form>
+            </div>
+            <div id="panel-about" role="tabpanel" aria-labelledby="tab-about" hidden>
+                <p class="share-name">Self-hosted YouTube-to-podcast server</p>
+                <dl class="about-meta">
+                    <div><dt>Version</dt><dd id="about-version">—</dd></div>
+                    <div><dt>Running since</dt><dd id="about-started">—</dd></div>
+                </dl>
+                <h4 class="about-h">Changelog</h4>
+                <div id="changelog-list" class="changelog"></div>
+                <p class="share-name" style="margin-top:14px;margin-bottom:0">
+                    <a href="/static/design-system.html" target="_blank" rel="noopener">View design system &rarr;</a>
+                </p>
+            </div>
         </div>
     </div>
 
@@ -982,7 +1047,7 @@ def api_state():
         "orphans": orphans,
         "total_bytes": total_bytes,
         "cookies": cookies_status(),
-        "email": {"configured": notify._smtp_configured(), "address": ALERT_EMAIL},
+        "email": {"configured": notify._smtp_configured(), "address": config.ALERT_EMAIL},
         "next_poll": _next_poll_label(),
         "polling": _polling_state(),
         "jobs": jobs.snapshot(),
@@ -1001,6 +1066,33 @@ def api_changelog():
         "started_at": STARTED_AT,
         "entries": changelog.CHANGELOG,
     })
+
+
+@app.get("/api/settings")
+def api_settings():
+    return JSONResponse({"settings": settings.snapshot()})
+
+
+@app.post("/settings")
+async def save_settings(request: Request):
+    """Save dashboard overrides from a JSON {"values": {NAME: value}} body.
+
+    All-or-nothing: one invalid value rejects the whole save, naming the field.
+    """
+    try:
+        data = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Expected a JSON body") from None
+    values = data.get("values") if isinstance(data, dict) else None
+    if not isinstance(values, dict):
+        raise HTTPException(status_code=400, detail="Expected {\"values\": {...}}")
+    try:
+        changed = await run_in_threadpool(settings.save, values)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    _apply_setting_changes(changed)
+    return _ok("Settings saved" if changed else "No changes", changed=changed,
+               settings=settings.snapshot())
 
 
 @app.get("/api/channels/{channel_id}/episodes")
@@ -1252,7 +1344,7 @@ async def poll_channels_bulk(request: Request):
     # immediately (it only queues the work), so the endpoint still responds
     # right away; poll_channel's own per-channel lock covers the rest.
     for u in urls:
-        _poll_executor.submit(_run_poll, u)
+        _submit_poll(u)
     return _ok(f"Polling {len(urls)} channel(s)")
 
 
@@ -1260,7 +1352,7 @@ async def poll_channels_bulk(request: Request):
 def poll_all_now():
     channels = db.get_channels()
     for ch in channels:
-        _poll_executor.submit(_run_poll, ch["url"])
+        _submit_poll(ch["url"])
     return _ok(f"Polling {len(channels)} channel(s)")
 
 
@@ -1379,7 +1471,7 @@ def _liveness(checks: dict[str, str]) -> list[str]:
     # A poll finishing later than ~3x its own interval means it's stuck, not
     # just running a bit long (matches the coalesce/misfire tolerance the
     # scheduler itself is configured with — see lifespan).
-    stale_after = POLL_INTERVAL_HOURS * 3 * 3600
+    stale_after = config.POLL_INTERVAL_HOURS * 3 * 3600
     uptime = time.monotonic() - _STARTED_MONOTONIC
     last_poll_age = _seconds_since_last_poll()
     if not channels:

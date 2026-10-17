@@ -154,7 +154,7 @@ def test_health_not_degraded_before_first_poll_grace_period(monkeypatch):
 def test_health_degraded_when_no_poll_ever_completed_past_grace(monkeypatch):
     monkeypatch.setattr(db, "get_channels", lambda: [{"url": "https://x", "channel_id": None}])
     monkeypatch.setattr(db, "get_recent_poll_runs", lambda limit=1: [])
-    monkeypatch.setattr(main, "POLL_INTERVAL_HOURS", 1)
+    monkeypatch.setattr(config, "POLL_INTERVAL_HOURS", 1)
 
     class _FakeSched:
         running = True
@@ -684,7 +684,7 @@ def test_health_live_degraded_when_scheduler_down(monkeypatch):
 def test_health_live_degraded_when_polling_stalled(monkeypatch):
     db.init_db()
     monkeypatch.setattr(db, "get_channels", lambda: [{"url": "https://x", "channel_id": None}])
-    monkeypatch.setattr(main, "POLL_INTERVAL_HOURS", 1)
+    monkeypatch.setattr(config, "POLL_INTERVAL_HOURS", 1)
     _live_ok_scheduler(monkeypatch)
     monkeypatch.setattr(main, "_STARTED_MONOTONIC", time.monotonic() - 999999)
     old = "2020-01-01T00:00:00+00:00"
@@ -742,7 +742,7 @@ def _seed_channel_with_episode(tmp_path, monkeypatch, cid=FCID):
 def test_feed_without_token_works_when_enforcement_off(tmp_path, monkeypatch):
     """AC1: the default (enforcement off) must not break token-less URLs."""
     _seed_channel_with_episode(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", False)
+    monkeypatch.setattr(config, "REQUIRE_FEED_TOKENS", False)
     resp = main.get_feed(FCID)
     assert resp.media_type == "application/rss+xml"
     assert b"<item>" in resp.body
@@ -751,7 +751,7 @@ def test_feed_without_token_works_when_enforcement_off(tmp_path, monkeypatch):
 def test_feed_requires_token_when_enforcement_on(tmp_path, monkeypatch):
     """AC2: missing/wrong token 404s; the right one serves the feed."""
     _seed_channel_with_episode(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", True)
+    monkeypatch.setattr(config, "REQUIRE_FEED_TOKENS", True)
 
     with pytest.raises(HTTPException) as exc:
         main.get_feed(FCID)
@@ -771,7 +771,7 @@ def test_feed_token_404s_when_channel_has_no_row(tmp_path, monkeypatch):
     once enforcement is on, rather than servable by anyone."""
     _setup_tmp_db(tmp_path, monkeypatch)
     monkeypatch.setattr(feed, "BASE_URL", "https://example.test")
-    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", True)
+    monkeypatch.setattr(config, "REQUIRE_FEED_TOKENS", True)
     orphan = "UCorphan123456789012345678"
     db.upsert_episode({
         "id": "vid00000002", "channel_id": orphan, "channel_name": "Orphan",
@@ -785,9 +785,9 @@ def test_feed_token_404s_when_channel_has_no_row(tmp_path, monkeypatch):
 
 
 def test_token_ok_is_inert_while_enforcement_off(monkeypatch):
-    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", False)
+    monkeypatch.setattr(config, "REQUIRE_FEED_TOKENS", False)
     assert main._token_ok(None, None) is True
-    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", True)
+    monkeypatch.setattr(config, "REQUIRE_FEED_TOKENS", True)
     # compare_digest would raise on a None; the guard must return False instead.
     assert main._token_ok(None, "x") is False
     assert main._token_ok("x", None) is False
@@ -846,7 +846,7 @@ def test_all_feed_route_is_not_swallowed_by_channel_route(tmp_path, monkeypatch)
 
 def test_combined_feed_requires_token_when_enforcement_on(tmp_path, monkeypatch):
     _seed_channel_with_episode(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "REQUIRE_FEED_TOKENS", True)
+    monkeypatch.setattr(config, "REQUIRE_FEED_TOKENS", True)
     with pytest.raises(HTTPException) as exc:
         main.get_combined_feed()
     assert exc.value.status_code == 404

@@ -553,13 +553,140 @@ function changelogEntry(entry) {
   return el('div', { class: 'cl-entry' }, [head, list]);
 }
 
-async function openSettings() {
-  const modal = $('#settings-modal');
+/* Settings tab: fields rendered from /api/settings. Only fields whose value
+   differs from what the server sent are submitted, so an untouched form never
+   writes anything. */
+let prefsLoaded = [];  // last snapshot from the server
+
+function prefInputValue(s) {
+  const input = $(`#pref-${s.name}`);
+  return s.kind === 'bool' ? input.checked : input.value.trim();
+}
+
+function prefDirty() {
+  const out = {};
+  for (const s of prefsLoaded) {
+    const v = prefInputValue(s);
+    if (String(v) !== String(s.value)) out[s.name] = v;
+  }
+  return out;
+}
+
+function updatePrefsState() {
+  const dirty = prefDirty();
+  $('#prefs-save').disabled = !Object.keys(dirty).length;
+  for (const s of prefsLoaded) {
+    const v = prefInputValue(s);
+    const reset = $(`#pref-reset-${s.name}`);
+    if (reset) reset.hidden = String(v) === String(s.default);
+  }
+}
+
+function fmtDefault(s) {
+  if (s.kind === 'bool') return s.default ? 'on' : 'off';
+  if (s.kind === 'email') return s.default || 'blank';
+  return String(s.default);
+}
+
+function prefField(s) {
+  const id = `pref-${s.name}`;
+  let input;
+  if (s.kind === 'bool') {
+    input = el('input', { id, type: 'checkbox', checked: !!s.value, onchange: updatePrefsState });
+  } else if (s.kind === 'email') {
+    input = el('input', { id, type: 'email', value: s.value || '', placeholder: 'no alerts', maxlength: '254', oninput: updatePrefsState });
+  } else {
+    input = el('input', { id, type: 'number', inputmode: 'numeric', step: '1', min: String(s.min), max: String(s.max), value: String(s.value), oninput: updatePrefsState });
+  }
+  const reset = el('button', {
+    id: `pref-reset-${s.name}`, class: 'pref-reset', type: 'button', text: 'Reset',
+    title: `Back to the .env default (${fmtDefault(s)})`,
+    onclick: () => {
+      if (s.kind === 'bool') input.checked = !!s.default; else input.value = s.default ?? '';
+      updatePrefsState();
+    },
+  });
+  const hint = el('span', { class: 'pref-hint' }, [s.help, ` Default: ${fmtDefault(s)}.`]);
+  if (s.kind === 'bool') {
+    return el('div', { class: 'pref pref-bool' }, [
+      el('label', { class: 'check', for: id }, [input, el('span', { class: 'pref-label', text: s.label })]),
+      reset, hint,
+    ]);
+  }
+  return el('div', { class: 'pref' }, [
+    el('label', { class: 'pref-label', for: id, text: s.label }), reset, input, hint,
+  ]);
+}
+
+function renderPrefs(list) {
+  prefsLoaded = list;
+  const box = $('#prefs-fields');
+  box.replaceChildren();
+  const groups = new Map();
+  for (const s of list) {
+    if (!groups.has(s.group)) groups.set(s.group, []);
+    groups.get(s.group).push(s);
+  }
+  for (const [name, items] of groups) {
+    box.appendChild(el('fieldset', { class: 'pref-group' }, [
+      el('legend', { class: 'about-h', text: name }),
+      ...items.map(prefField),
+    ]));
+  }
+  updatePrefsState();
+}
+
+async function loadPrefs() {
+  const box = $('#prefs-fields');
+  box.replaceChildren(el('div', { class: 'ep-empty', text: 'Loading…' }));
+  $('#prefs-save').disabled = true;
+  try {
+    const res = await fetch('/api/settings');
+    if (!res.ok) throw new Error(await readError(res));
+    renderPrefs((await res.json()).settings || []);
+  } catch (e) {
+    box.replaceChildren(el('div', { class: 'ep-empty', text: e.message || 'Failed to load settings' }));
+  }
+}
+
+async function submitPrefs() {
+  const values = prefDirty();
+  if (!Object.keys(values).length) return;
+  const btn = $('#prefs-save');
+  btn.disabled = true;
+  try {
+    const r = await postJSON('/settings', { values });
+    if (r.settings) renderPrefs(r.settings);
+    toast(r.message || 'Settings saved', 'ok');
+    loadState();  // polling interval / email address shown on the dashboard
+  } catch (e) {
+    toast(e.message || 'Failed to save settings', 'err');
+    updatePrefsState();
+  }
+}
+
+function selectSettingsTab(which) {
+  for (const t of ['prefs', 'about']) {
+    const on = t === which;
+    const tab = $(`#tab-${t}`);
+    tab.setAttribute('aria-selected', String(on));
+    tab.tabIndex = on ? 0 : -1;
+    $(`#panel-${t}`).hidden = !on;
+  }
+  if (which === 'about') loadAbout();
+}
+
+function openSettings() {
+  $('#settings-modal').hidden = false;
+  selectSettingsTab('prefs');
+  loadPrefs();
+}
+
+async function loadAbout() {
   $('#about-version').textContent = state.data ? `v${state.data.version}` : '…';
   $('#about-started').textContent = '…';
   const list = $('#changelog-list');
   list.replaceChildren(el('div', { class: 'ep-empty', text: 'Loading…' }));
-  modal.hidden = false;
   try {
     const res = await fetch('/api/changelog');
     if (!res.ok) throw new Error(await readError(res));
@@ -723,6 +850,15 @@ function init() {
   // settings / about modal
   $('#settings-btn').addEventListener('click', openSettings);
   $$('#settings-modal [data-close]').forEach((n) => n.addEventListener('click', closeSettings));
+  $('#tab-prefs').addEventListener('click', () => selectSettingsTab('prefs'));
+  $('#tab-about').addEventListener('click', () => selectSettingsTab('about'));
+  $('#settings-modal [role=tablist]').addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const next = $('#tab-prefs').getAttribute('aria-selected') === 'true' ? 'about' : 'prefs';
+    selectSettingsTab(next);
+    $(`#tab-${next}`).focus();
+  });
+  $('#prefs-form').addEventListener('submit', (e) => { e.preventDefault(); submitPrefs(); });
 
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeShare(); closeEpisodes(); closeSettings(); closeFeedSettings(); } });
 

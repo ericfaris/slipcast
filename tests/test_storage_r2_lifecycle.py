@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app import database as db, downloader, notify
+from app import config, database as db, downloader, notify
 
 CID = "UCabc12345678901234567890"
 OTHER = "UCdef12345678901234567890"
@@ -41,7 +41,7 @@ def _seed_ep(fake, ep, size=10):
 
 def test_prune_channel_deletes_oldest_objects_and_index(r2, monkeypatch):
     drv, fake = r2
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 2)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 2)
     for i in range(5):
         _seed_ep(fake, _ep(i))
     drv.ensure_index()
@@ -61,7 +61,7 @@ def test_prune_channel_deletes_oldest_objects_and_index(r2, monkeypatch):
 
 def test_prune_drops_row_with_unsafe_filename_without_touching_storage(r2, monkeypatch):
     drv, fake = r2
-    monkeypatch.setattr(downloader, "MAX_EPISODES_PER_CHANNEL", 0)
+    monkeypatch.setattr(config, "MAX_EPISODES_PER_CHANNEL", 0)
     db.upsert_episode({**_ep(0, thumb=False), "filename": "../evil.mp3"})
     drv.ensure_index()
     downloader._prune_channel(CID)
@@ -133,7 +133,7 @@ def test_usage_and_orphans_from_index(r2):
 
 def test_disk_floor_skipped_in_r2_mode(r2, monkeypatch):
     drv, fake = r2
-    monkeypatch.setattr(downloader, "MIN_FREE_DISK_GB", 2)
+    monkeypatch.setattr(config, "MIN_FREE_DISK_GB", 2)
 
     def _no_disk(path):
         raise AssertionError("disk_usage must not be consulted in r2 mode")
