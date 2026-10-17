@@ -23,3 +23,12 @@ CSP is enforced on **redirect targets**, not just the original URL. Server logs
 showed clean 302s and the R2 objects returned 200 — the failure is only visible
 in the browser console. Fix: `driver.media_origin` added to img-src + media-src.
 Gotcha: when moving bytes off-origin, re-check the CSP; a test now pins both modes.
+
+## 2026-10-17 — base image 3.12 → 3.14
+
+- Moved to `python:3.14-slim-trixie` (CI on 3.14 as well); all 413 tests passed. 3.15.0 (released
+  that day) failed: `brotli`, pulled in by `yt-dlp[default]`, had no 3.15 wheel, and slim has no
+  gcc. Retry 3.15 once brotli ships wheels.
+- To test a new base image, run `pip install -r requirements.txt` in a throwaway `python:<tag>`
+  container. Don't use `--only-binary=:all:` here: `feedgen` is sdist-only (pure Python), so
+  that flag fails for a reason unrelated to the new Python.
