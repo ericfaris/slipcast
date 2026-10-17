@@ -914,7 +914,7 @@ _PAGE = """<!DOCTYPE html>
                 <form id="prefs-form" class="prefs-form" autocomplete="off" novalidate>
                     <div id="prefs-fields" class="prefs-fields"></div>
                     <div class="prefs-actions">
-                        <span class="prefs-note">Saved settings override .env and apply immediately.</span>
+                        <span id="prefs-note" class="prefs-note" role="status" aria-live="polite">Saved settings override .env and apply immediately.</span>
                         <button id="prefs-save" class="btn btn-primary" type="submit" disabled>Save</button>
                     </div>
                 </form>

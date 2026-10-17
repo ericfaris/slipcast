@@ -429,7 +429,8 @@ input[type=text], input[type=search], input[type=file], select {
 
 /* ---- Toaster ---- */
 .toaster {
-  position: fixed; top: 16px; right: 16px; z-index: 60;
+  /* Above .modal (80): toasts fired from inside a dialog must not sit under its backdrop. */
+  position: fixed; top: 16px; right: 16px; z-index: 90;
   display: flex; flex-direction: column; gap: 10px; max-width: min(360px, calc(100vw - 32px));
 }
 .toast {
@@ -540,6 +541,8 @@ input[type=text], input[type=search], input[type=file], select {
 .pref-reset:hover { text-decoration: underline; }
 .prefs-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
 .prefs-note { font-size: .76rem; color: var(--faint); }
+.prefs-note.ok { color: var(--success); font-weight: 600; }
+.prefs-note.err { color: var(--danger); font-weight: 600; }
 
 @media (max-width: 560px) {
   .prefs-actions { flex-direction: column; align-items: stretch; }

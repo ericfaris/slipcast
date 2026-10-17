@@ -8,6 +8,13 @@ whenever you cut a release. ``date`` is the release (commit/tag) date.
 
 CHANGELOG = [
     {
+        "version": "1.18.1",
+        "date": "2026-10-17",
+        "changes": [
+            "Fixed: saving in the Settings dialog showed no confirmation. Pop-up notifications were drawn behind any open dialog's dimmed background. They now appear on top, and the Settings dialog also shows \"✓ Settings saved\" (or what went wrong) next to the Save button.",
+        ],
+    },
+    {
         "version": "1.18.0",
         "date": "2026-10-17",
         "changes": [

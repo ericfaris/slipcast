@@ -557,6 +557,15 @@ function changelogEntry(entry) {
    differs from what the server sent are submitted, so an untouched form never
    writes anything. */
 let prefsLoaded = [];  // last snapshot from the server
+const PREFS_NOTE = 'Saved settings override .env and apply immediately.';
+
+// Inline status beside Save — the toast is in a far corner, easy to miss
+// while you're looking at the form.
+function setPrefsNote(text = PREFS_NOTE, kind = '') {
+  const note = $('#prefs-note');
+  note.textContent = text;
+  note.className = `prefs-note${kind ? ` ${kind}` : ''}`;
+}
 
 function prefInputValue(s) {
   const input = $(`#pref-${s.name}`);
@@ -575,6 +584,7 @@ function prefDirty() {
 function updatePrefsState() {
   const dirty = prefDirty();
   $('#prefs-save').disabled = !Object.keys(dirty).length;
+  if (Object.keys(dirty).length && $('#prefs-note').classList.contains('ok')) setPrefsNote();
   for (const s of prefsLoaded) {
     const v = prefInputValue(s);
     const reset = $(`#pref-reset-${s.name}`);
@@ -640,6 +650,7 @@ async function loadPrefs() {
   const box = $('#prefs-fields');
   box.replaceChildren(el('div', { class: 'ep-empty', text: 'Loading…' }));
   $('#prefs-save').disabled = true;
+  setPrefsNote();
   try {
     const res = await fetch('/api/settings');
     if (!res.ok) throw new Error(await readError(res));
@@ -657,9 +668,11 @@ async function submitPrefs() {
   try {
     const r = await postJSON('/settings', { values });
     if (r.settings) renderPrefs(r.settings);
+    setPrefsNote(`✓ ${r.message || 'Settings saved'}`, 'ok');
     toast(r.message || 'Settings saved', 'ok');
     loadState();  // polling interval / email address shown on the dashboard
   } catch (e) {
+    setPrefsNote(e.message || 'Failed to save settings', 'err');
     toast(e.message || 'Failed to save settings', 'err');
     updatePrefsState();
   }

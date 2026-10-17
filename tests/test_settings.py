@@ -233,3 +233,22 @@ def test_concurrency_change_swaps_poll_pool(monkeypatch):
     main._submit_poll("https://youtube.com/@x")  # lands on the new pool
     main._poll_executor.shutdown(wait=True)
     assert ran == ["https://youtube.com/@x"]
+
+
+def test_toasts_render_above_dialogs():
+    """Regression: the toaster sat at z-index 60 under .modal (80), so the
+    'Settings saved' toast was hidden behind the dialog's backdrop."""
+    import re
+    css = (APP_DIR / "static" / "styles.css").read_text()
+
+    def z(selector):
+        block = re.search(r"^" + re.escape(selector) + r"\s*\{([^}]*)\}", css, re.M).group(1)
+        return int(re.search(r"z-index:\s*(\d+)", block).group(1))
+
+    assert z(".toaster") > z(".modal")
+
+
+def test_settings_dialog_has_inline_save_status():
+    """The Save result is also shown next to the button (app.js setPrefsNote)."""
+    assert 'id="prefs-note"' in main._PAGE and 'aria-live="polite"' in main._PAGE
+    assert "setPrefsNote(" in (APP_DIR / "static" / "app.js").read_text()
