@@ -54,8 +54,3 @@ def snapshot() -> list[dict]:
     """Return all tracked jobs, oldest first."""
     with _lock:
         return [dict(j) for j in sorted(_jobs.values(), key=lambda j: j["id"])]
-
-
-def active_count() -> int:
-    with _lock:
-        return sum(1 for j in _jobs.values() if j["status"] == "running")

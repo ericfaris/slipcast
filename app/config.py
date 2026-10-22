@@ -45,10 +45,9 @@ MIN_FREE_DISK_GB = int(os.environ.get("MIN_FREE_DISK_GB", "2"))
 # straight from the environment, so secrets never sit in an importable module
 # attribute. Only the non-secret tuning knobs live here.
 #
-# Per-download temp dirs (r2 mode only): yt-dlp writes here, only the finished
-# file is uploaded, and the dir is removed afterwards. Blank means
-# <tempdir>/slipcast-staging. Must never point at DATA_DIR or its media dirs.
-STORAGE_STAGING_DIR = os.environ.get("STORAGE_STAGING_DIR", "").strip()
+# STORAGE_STAGING_DIR (per-download temp dirs in r2 mode) is read by
+# app/storage.py's config_from_env, not here.
+#
 # How often the in-memory index of bucket objects is rebuilt with ListObjectsV2
 # (picks up out-of-process changes such as the migration script's uploads).
 STORAGE_INDEX_REFRESH_MINUTES = int(os.environ.get("STORAGE_INDEX_REFRESH_MINUTES", "10"))
