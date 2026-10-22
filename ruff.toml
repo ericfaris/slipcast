@@ -1,0 +1,5 @@
+# CI lint gate (`ruff check .`, run before the tests). Pyflakes + syntax
+# errors only: unused imports/variables, undefined names, f-strings with no
+# placeholders. Style rules stay off so the gate only fails on real problems.
+[lint]
+select = ["E9", "F"]
