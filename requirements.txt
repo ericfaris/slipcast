@@ -2,7 +2,7 @@
 # YouTube extractor fixes, so Renovate (see renovate.json) opens a PR on each new
 # release to keep this current — bumps are CI-tested before they ship.
 # [default] bundles yt-dlp-ejs (the YouTube n-challenge solver scripts).
-yt-dlp[default]==2026.10.21
+yt-dlp[default]==2026.10.26
 fastapi==0.162.0
 uvicorn[standard]==0.54.0
 apscheduler==3.11.3
