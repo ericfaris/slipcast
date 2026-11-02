@@ -7,7 +7,7 @@ fastapi==0.162.0
 uvicorn[standard]==0.54.0
 apscheduler==3.11.3
 feedgen==1.0.0
-python-multipart==0.0.32
+python-multipart==0.0.33
 # S3 client for Cloudflare R2 media storage (STORAGE=r2); exact-pinned, Renovate
 # bumps it. Imported lazily — local mode never loads it.
 boto3==1.43.118
